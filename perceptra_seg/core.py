@@ -275,12 +275,16 @@ class Segmentor:
         output_formats: list[str] | None = None,
     ) -> list[SegmentationResult]:
         """Segment using SAM3 text prompt."""
+        start_time = time.time()
+
         if self.backend is None:
             raise BackendError("Backend not loaded")
 
         img = load_image(image)
 
         masks, scores = self.backend.infer_from_text(img, text)
+        total_latency = (time.time() - start_time) * 1000
+        per_item_latency = total_latency / len(masks) if masks else total_latency
 
         results = []
         for mask, score in zip(masks, scores):
@@ -289,7 +293,7 @@ class Segmentor:
                 mask=mask,
                 score=score,
                 output_formats=output_formats or self.config.outputs.default_formats,  # type: ignore
-                latency_ms=0, 
+                latency_ms=per_item_latency,
                 request_id=str(uuid.uuid4()),
             )
             results.append(result)
@@ -304,6 +308,8 @@ class Segmentor:
         output_formats: list[str] | None = None,
     ) -> list[SegmentationResult]:
         """Segment using SAM3 exemplar visual prompt."""
+        start_time = time.time()
+
         if self.backend is None:
             raise BackendError("Backend not loaded")
 
@@ -311,6 +317,8 @@ class Segmentor:
         self._validate_box(box, img.shape)    #type: ignore
 
         masks, scores = self.backend.infer_from_exemplar_box(img, box)
+        total_latency = (time.time() - start_time) * 1000
+        per_item_latency = total_latency / len(masks) if masks else total_latency
 
         results = []
         for mask, score in zip(masks, scores):
@@ -320,7 +328,7 @@ class Segmentor:
                     mask=mask,
                     score=score,
                     output_formats=output_formats or self.config.outputs.default_formats,   # type: ignore
-                    latency_ms=0,
+                    latency_ms=per_item_latency,
                     request_id=str(uuid.uuid4()),
                 )
             )
@@ -336,6 +344,7 @@ class Segmentor:
         output_formats: list[str] | None = None,
     ) -> list[SegmentationResult]:
         """Segment using combined text + box prompts."""
+        start_time = time.time()
         if self.backend is None:
             raise BackendError("Backend not loaded")
 
@@ -343,6 +352,8 @@ class Segmentor:
         self._validate_box(box, img.shape)  # type: ignore
 
         masks, scores = self.backend.infer_from_text_and_box(img, text, box)
+        total_latency = (time.time() - start_time) * 1000
+        per_item_latency = total_latency / len(masks) if masks else total_latency
 
         results = []
         for mask, score in zip(masks, scores):
@@ -352,7 +363,7 @@ class Segmentor:
                     mask=mask,
                     score=score,
                     output_formats=output_formats or self.config.outputs.default_formats,  # type: ignore
-                    latency_ms=0,
+                    latency_ms=per_item_latency,
                     request_id=str(uuid.uuid4()),
                 )
             )
@@ -364,6 +375,8 @@ class Segmentor:
         image: np.ndarray | Image.Image | bytes | str | Path,
         boxes: list[tuple[int, int, int, int]] | None = None,
         points: list[tuple[int, int, int]] | None = None,
+        text: str | None = None,
+        exemplar_box: tuple[int, int, int, int] | None = None,
         *,
         strategy: Literal["merge", "largest", "all"] = "largest",
         output_formats: list[str] | None = None,
@@ -382,35 +395,53 @@ class Segmentor:
         Returns:
             List of SegmentationResult instances
         """
-        if boxes is None and points is None:
+        if not any([boxes, points, text, exemplar_box]):
             raise InvalidPromptError("Must provide either boxes or points")
 
-        results = []
-
-        if boxes:
-            for box in boxes:
-                result = self.segment_from_box(
-                    image, box, output_formats=output_formats, return_overlay=return_overlay
-                )
-                results.append(result)
-
-        if points:
-            result = self.segment_from_points(
-                image, points, output_formats=output_formats, return_overlay=return_overlay
+        if boxes and not points:
+            results = self.segment_batch(
+                image, boxes=boxes, output_formats=output_formats, return_overlay=return_overlay
             )
-            results.append(result)
+
+        elif points and not boxes:
+            results = self.segment_batch(
+                image, points=[points], output_formats=output_formats, return_overlay=return_overlay
+            )
+        else:
+            # Mixed prompts - combine batch results
+            results = []
+            if boxes:
+                results.extend(
+                    self.segment_batch(image, boxes=boxes, output_formats=output_formats)
+                )
+            if points:
+                results.extend(
+                    self.segment_batch(image, points=[points], output_formats=output_formats)
+                )
+            # Semantic prompts (SAM3)
+            if text:
+                results.extend(
+                    self.segment_from_text(image, text, output_formats=output_formats)
+                )
+            
+            if exemplar_box:
+                results.extend(
+                    self.segment_from_exemplar_box(image, exemplar_box, output_formats=output_formats)
+                )
 
         # Apply strategy
         if strategy == "largest" and len(results) > 1:
             largest = max(results, key=lambda r: r.area)
             return [largest]
         elif strategy == "merge" and len(results) > 1:
-            # Merge masks
-            merged_mask = np.zeros_like(results[0].mask) if results[0].mask is not None else None
-            if merged_mask is not None:
-                for r in results:
-                    if r.mask is not None:
-                        merged_mask = np.logical_or(merged_mask, r.mask)
+            # Validate first result has mask
+            if results[0].mask is None:
+                raise BackendError("Cannot merge: numpy format required. Add 'numpy' to output_formats")
+            
+            merged_mask = results[0].mask.copy()
+            for r in results[1:]:
+                if r.mask is not None:
+                    merged_mask = np.logical_or(merged_mask, r.mask)
 
                 # Create merged result
                 merged_result = self._create_result(
@@ -471,26 +502,32 @@ class Segmentor:
             
             # Backend batch inference
             masks, scores = self.backend.infer_from_boxes_batch(img_array, boxes)
-            
+            total_latency = (time.time() - start_time) * 1000
+            per_item_latency = total_latency / len(masks) if masks else 0
+
             for mask, score in zip(masks, scores):
                 mask = self._postprocess_mask(mask, img_array.shape)          #type: ignore
                 result = self._create_result(
                     mask=mask,
                     score=score,
                     output_formats=output_formats,               #type: ignore
-                    latency_ms=(time.time() - start_time) * 1000,
+                    latency_ms=per_item_latency,
                     request_id=str(uuid.uuid4()),
                 )
                 results.append(result)
         
         # Process points in batch
         if points:
+            points_start = time.time()
+
             # Validate all points first
             for point_list in points:
                 self._validate_points(point_list, img_array.shape)          #type: ignore
             
             # Backend batch inference
             masks, scores = self.backend.infer_from_points_batch(img_array, points)
+            total_latency = (time.time() - points_start) * 1000
+            per_item_latency = total_latency / len(masks) if masks else 0
             
             for mask, score in zip(masks, scores):
                 mask = self._postprocess_mask(mask, img_array.shape)          #type: ignore
@@ -498,7 +535,7 @@ class Segmentor:
                     mask=mask,
                     score=score,
                     output_formats=output_formats,                   #type: ignore
-                    latency_ms=(time.time() - start_time) * 1000,
+                    latency_ms=per_item_latency,
                     request_id=str(uuid.uuid4()),
                 )
                 results.append(result)

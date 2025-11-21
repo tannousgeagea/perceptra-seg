@@ -93,11 +93,7 @@ class TorchSAMv1Backend:
                 multimask_output=False,
             )
 
-            # Return first mask (we use single mask mode)
-            mask = masks[0].astype(np.uint8)
-            score = float(scores[0])
-
-            return mask, score
+            return masks[0].astype(np.uint8), float(scores[0])
 
         except Exception as e:
             raise BackendError(f"SAM v1 inference failed: {e}") from e
