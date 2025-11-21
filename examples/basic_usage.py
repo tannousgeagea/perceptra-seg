@@ -21,7 +21,7 @@ def main() -> None:
     print("\nInitializing Segmentor...")
     seg = Segmentor(
         backend="torch",
-        model="sam_v1",
+        model="sam_v3",
         device="cuda"  # Change to "cpu" if no GPU
     )
     

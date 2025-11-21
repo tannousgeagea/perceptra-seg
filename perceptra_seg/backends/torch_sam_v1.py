@@ -24,7 +24,7 @@ class TorchSAMv1Backend:
     def load(self) -> None:
         """Load SAM v1 model."""
         try:
-            from segment_anything import sam_model_registry, SamPredictor
+            from segment_anything import sam_model_registry, SamPredictor     # type: ignore
 
             device_str = self.config.runtime.device
             self.device = torch.device(device_str if torch.cuda.is_available() else "cpu")
@@ -83,12 +83,12 @@ class TorchSAMv1Backend:
     ) -> tuple[np.ndarray, float]:
         """Generate mask from bounding box."""
         try:
-            self.predictor.set_image(image)
+            self.predictor.set_image(image)        # type:ignore
 
             # SAM expects box as numpy array
             box_np = np.array(box)
 
-            masks, scores, _ = self.predictor.predict(
+            masks, scores, _ = self.predictor.predict(            # type:ignore
                 box=box_np,
                 multimask_output=False,
             )
@@ -107,14 +107,14 @@ class TorchSAMv1Backend:
     ) -> tuple[np.ndarray, float]:
         """Generate mask from point prompts."""
         try:
-            self.predictor.set_image(image)
+            self.predictor.set_image(image)             # type:ignore
 
             # Convert points to numpy arrays
             point_coords = np.array([[x, y] for x, y, _ in points])
             point_labels = np.array([label for _, _, label in points])
 
-            masks, scores, _ = self.predictor.predict(
-                point_coords=point_coords,
+            masks, scores, _ = self.predictor.predict(             # type:ignore
+                point_coords=point_coords, 
                 point_labels=point_labels,
                 multimask_output=False,
             )
@@ -143,19 +143,19 @@ class TorchSAMv1Backend:
             import torch
             
             # Set image once (computes embedding once)
-            self.predictor.set_image(image)
+            self.predictor.set_image(image)           # type:ignore
             
             # Convert boxes to torch tensor
-            input_boxes = torch.tensor(boxes, device=self.predictor.device)
+            input_boxes = torch.tensor(boxes, device=self.predictor.device) # type:ignore
             
             # Transform boxes to the input frame
-            transformed_boxes = self.predictor.transform.apply_boxes_torch(
+            transformed_boxes = self.predictor.transform.apply_boxes_torch(          # type:ignore
                 input_boxes, 
                 image.shape[:2]
             )
             
             # Batch prediction using predict_torch
-            masks, scores, _ = self.predictor.predict_torch(
+            masks, scores, _ = self.predictor.predict_torch(           # type:ignore
                 point_coords=None,
                 point_labels=None,
                 boxes=transformed_boxes,
@@ -190,7 +190,7 @@ class TorchSAMv1Backend:
         """Generate masks from multiple point prompts efficiently."""
         try:
             # Set image once
-            self.predictor.set_image(image)
+            self.predictor.set_image(image)             # type:ignore 
             
             mask_list = []
             score_list = []
@@ -200,7 +200,7 @@ class TorchSAMv1Backend:
                 point_coords = np.array([[x, y] for x, y, _ in points])
                 point_labels = np.array([label for _, _, label in points])
                 
-                masks, scores, _ = self.predictor.predict(
+                masks, scores, _ = self.predictor.predict(              # type:ignore
                     point_coords=point_coords,
                     point_labels=point_labels,
                     multimask_output=False,
@@ -213,6 +213,50 @@ class TorchSAMv1Backend:
             
         except Exception as e:
             raise BackendError(f"SAM v1 batch inference failed: {e}") from e
+
+    def infer_from_text(
+        self, image: np.ndarray, text: str
+    ) -> tuple[list[np.ndarray], list[float]]:
+        """
+        Generate masks from a text prompt (Concept Segmentation).
+        
+        Args:
+            image: RGB image (HxWx3)
+            text: Natural language description (e.g., "person", "red car")
+
+        Returns:
+            Tuple of (list of binary_masks, list of confidence_scores). 
+            Returns multiple masks as text prompts imply detection of all instances.
+        """
+        raise NotImplementedError
+
+    def infer_from_exemplar_box(
+        self, image: np.ndarray, box: tuple[int, int, int, int]
+    ) -> tuple[list[np.ndarray], list[float]]:
+        """
+        Generate masks by visually searching for an exemplar object.
+
+        Args:
+            image: RGB image to search in (HxWx3)
+            exemplar: RGB crop of the reference object (HxWx3)
+
+        Returns:
+            Tuple of (list of binary_masks, list of confidence_scores).
+        """
+        raise NotImplementedError
+
+    def infer_from_text_and_box(
+        self,
+        image: np.ndarray,
+        text: str,
+        box: tuple[int, int, int, int],
+    ) -> tuple[list[np.ndarray], list[float]]:
+        """
+        Combined text + box prompt.
+        Example: "find blue pipe objects within this box"
+        """
+        raise NotImplementedError
+
 
     def close(self) -> None:
         """Clean up resources."""

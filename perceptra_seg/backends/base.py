@@ -75,6 +75,51 @@ class BaseSAMBackend(Protocol):
         """
         ...
 
+# --- Semantic Prompts (New in SAM 3) ---
+
+    def infer_from_text(
+        self, image: np.ndarray, text: str
+    ) -> tuple[list[np.ndarray], list[float]]:
+        """
+        Generate masks from a text prompt (Concept Segmentation).
+        
+        Args:
+            image: RGB image (HxWx3)
+            text: Natural language description (e.g., "person", "red car")
+
+        Returns:
+            Tuple of (list of binary_masks, list of confidence_scores). 
+            Returns multiple masks as text prompts imply detection of all instances.
+        """
+        ...
+
+    def infer_from_exemplar_box(
+        self, image: np.ndarray, box: tuple[int, int, int, int]
+    ) -> tuple[list[np.ndarray], list[float]]:
+        """
+        Generate masks by visually searching for an exemplar object.
+
+        Args:
+            image: RGB image to search in (HxWx3)
+            exemplar: RGB crop of the reference object (HxWx3)
+
+        Returns:
+            Tuple of (list of binary_masks, list of confidence_scores).
+        """
+        ...
+
+    def infer_from_text_and_box(
+        self,
+        image: np.ndarray,
+        text: str,
+        box: tuple[int, int, int, int],
+    ) -> tuple[list[np.ndarray], list[float]]:
+        """
+        Combined text + box prompt.
+        Example: "find blue pipe objects within this box"
+        """
+        ...
+
     def close(self) -> None:
         """Clean up resources."""
         ...

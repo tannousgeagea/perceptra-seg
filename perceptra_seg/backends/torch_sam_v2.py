@@ -24,8 +24,8 @@ class TorchSAMv2Backend:
     def load(self) -> None:
         """Load SAM v2 model."""
         try:
-            from sam2.build_sam import build_sam2
-            from sam2.sam2_image_predictor import SAM2ImagePredictor
+            from sam2.build_sam import build_sam2             # type: ignore
+            from sam2.sam2_image_predictor import SAM2ImagePredictor       # type: ignore
 
             device_str = self.config.runtime.device
             self.device = torch.device(device_str if torch.cuda.is_available() else "cpu")
@@ -209,6 +209,49 @@ class TorchSAMv2Backend:
             
         except Exception as e:
             raise BackendError(f"SAM v2 batch inference failed: {e}") from e
+
+    def infer_from_text(
+        self, image: np.ndarray, text: str
+    ) -> tuple[list[np.ndarray], list[float]]:
+        """
+        Generate masks from a text prompt (Concept Segmentation).
+        
+        Args:
+            image: RGB image (HxWx3)
+            text: Natural language description (e.g., "person", "red car")
+
+        Returns:
+            Tuple of (list of binary_masks, list of confidence_scores). 
+            Returns multiple masks as text prompts imply detection of all instances.
+        """
+        raise NotImplementedError
+
+    def infer_from_exemplar_box(
+        self, image: np.ndarray, box: tuple[int, int, int, int]
+    ) -> tuple[list[np.ndarray], list[float]]:
+        """
+        Generate masks by visually searching for an exemplar object.
+
+        Args:
+            image: RGB image to search in (HxWx3)
+            exemplar: RGB crop of the reference object (HxWx3)
+
+        Returns:
+            Tuple of (list of binary_masks, list of confidence_scores).
+        """
+        raise NotImplementedError
+
+    def infer_from_text_and_box(
+        self,
+        image: np.ndarray,
+        text: str,
+        box: tuple[int, int, int, int],
+    ) -> tuple[list[np.ndarray], list[float]]:
+        """
+        Combined text + box prompt.
+        Example: "find blue pipe objects within this box"
+        """
+        raise NotImplementedError
 
     def close(self) -> None:
         """Clean up resources."""

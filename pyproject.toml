@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "perceptra-seg"
-version = "0.1.1"
+version = "0.2.1"
 description = "Production-grade segmentation tool with SAM v1/v2 support"
 authors = [{name = "Tannous Geagea", email = "tannousgeagea@hotmail.com"}]
 readme = "README.md"

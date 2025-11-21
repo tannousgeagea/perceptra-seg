@@ -129,6 +129,22 @@ class Segmentor:
                 
                 from perceptra_seg.backends.torch_sam_v2 import TorchSAMv2Backend
                 self.backend = TorchSAMv2Backend(self.config)
+            elif backend_key == "torch_sam_v3":
+                # Check if SAM v2 is installed
+                try:
+                    ensure_dependency(
+                        package_name="sam3",
+                        git_url="https://github.com/facebookresearch/sam3.git",
+                        optional=True,
+                    )
+                except ImportError:
+                    raise ModelLoadError(
+                        "SAM v3 not found. Install it with:\n"
+                        "  pip install git+https://github.com/facebookresearch/sam3.git"
+                    )
+                
+                from perceptra_seg.backends.torch_sam_v3 import TorchSAMv3Backend
+                self.backend = TorchSAMv3Backend(self.config)
             elif backend_key == "onnx_sam_v1":
                 from perceptra_seg.backends.onnx_sam_v1 import ONNXSAMv1Backend
 
@@ -182,10 +198,10 @@ class Segmentor:
 
         # Load and validate image
         img_array = load_image(image)
-        self._validate_box(box, img_array.shape)
+        self._validate_box(box, img_array.shape)      #type: ignore
 
         if output_formats is None:
-            output_formats = self.config.outputs.default_formats
+            output_formats = self.config.outputs.default_formats       #type: ignore
 
         # Perform segmentation
         if self.backend is None:
@@ -194,13 +210,13 @@ class Segmentor:
         mask, score = self.backend.infer_from_box(img_array, box)
 
         # Postprocess
-        mask = self._postprocess_mask(mask, img_array.shape)
+        mask = self._postprocess_mask(mask, img_array.shape)             #type: ignore
 
         # Generate outputs
         result = self._create_result(
             mask=mask,
             score=score,
-            output_formats=output_formats,
+            output_formats=output_formats,                   #type: ignore
             latency_ms=(time.time() - start_time) * 1000,
             request_id=request_id,
         )
@@ -230,26 +246,118 @@ class Segmentor:
         request_id = str(uuid.uuid4())
 
         img_array = load_image(image)
-        self._validate_points(points, img_array.shape)
+        self._validate_points(points, img_array.shape)            #type: ignore
 
         if output_formats is None:
-            output_formats = self.config.outputs.default_formats
+            output_formats = self.config.outputs.default_formats          #type: ignore
 
         if self.backend is None:
             raise BackendError("Backend not loaded")
 
         mask, score = self.backend.infer_from_points(img_array, points)
-        mask = self._postprocess_mask(mask, img_array.shape)
-
+        mask = self._postprocess_mask(mask, img_array.shape)          #type: ignore
+ 
         result = self._create_result(
             mask=mask,
             score=score,
-            output_formats=output_formats,
+            output_formats=output_formats,         #type: ignore
             latency_ms=(time.time() - start_time) * 1000,
             request_id=request_id,
         )
 
         return result
+
+    def segment_from_text(
+        self,
+        image: np.ndarray | Image.Image | bytes | str | Path,
+        text: str,
+        *,
+        output_formats: list[str] | None = None,
+    ) -> list[SegmentationResult]:
+        """Segment using SAM3 text prompt."""
+        if self.backend is None:
+            raise BackendError("Backend not loaded")
+
+        img = load_image(image)
+
+        masks, scores = self.backend.infer_from_text(img, text)
+
+        results = []
+        for mask, score in zip(masks, scores):
+            mask = self._postprocess_mask(mask, img.shape)   # type: ignore
+            result = self._create_result(
+                mask=mask,
+                score=score,
+                output_formats=output_formats or self.config.outputs.default_formats,  # type: ignore
+                latency_ms=0, 
+                request_id=str(uuid.uuid4()),
+            )
+            results.append(result)
+
+        return results
+
+    def segment_from_exemplar_box(
+        self,
+        image: np.ndarray | Image.Image | bytes | str | Path,
+        box: tuple[int, int, int, int],
+        *,
+        output_formats: list[str] | None = None,
+    ) -> list[SegmentationResult]:
+        """Segment using SAM3 exemplar visual prompt."""
+        if self.backend is None:
+            raise BackendError("Backend not loaded")
+
+        img = load_image(image)
+        self._validate_box(box, img.shape)    #type: ignore
+
+        masks, scores = self.backend.infer_from_exemplar_box(img, box)
+
+        results = []
+        for mask, score in zip(masks, scores):
+            mask = self._postprocess_mask(mask, img.shape)      # type: ignore
+            results.append(
+                self._create_result(
+                    mask=mask,
+                    score=score,
+                    output_formats=output_formats or self.config.outputs.default_formats,   # type: ignore
+                    latency_ms=0,
+                    request_id=str(uuid.uuid4()),
+                )
+            )
+
+        return results
+
+    def segment_from_text_and_box(
+        self,
+        image: np.ndarray | Image.Image | bytes | str | Path,
+        text: str,
+        box: tuple[int, int, int, int],
+        *,
+        output_formats: list[str] | None = None,
+    ) -> list[SegmentationResult]:
+        """Segment using combined text + box prompts."""
+        if self.backend is None:
+            raise BackendError("Backend not loaded")
+
+        img = load_image(image)
+        self._validate_box(box, img.shape)  # type: ignore
+
+        masks, scores = self.backend.infer_from_text_and_box(img, text, box)
+
+        results = []
+        for mask, score in zip(masks, scores):
+            mask = self._postprocess_mask(mask, img.shape) # type: ignore
+            results.append(
+                self._create_result(
+                    mask=mask,
+                    score=score,
+                    output_formats=output_formats or self.config.outputs.default_formats,  # type: ignore
+                    latency_ms=0,
+                    request_id=str(uuid.uuid4()),
+                )
+            )
+
+        return results
 
     def segment(
         self,
@@ -307,8 +415,8 @@ class Segmentor:
                 # Create merged result
                 merged_result = self._create_result(
                     mask=merged_mask.astype(np.uint8),
-                    score=np.mean([r.score for r in results]),
-                    output_formats=output_formats or self.config.outputs.default_formats,
+                    score=np.mean([r.score for r in results]),              #type: ignore
+                    output_formats=output_formats or self.config.outputs.default_formats,          #type: ignore
                     latency_ms=sum(r.latency_ms for r in results),
                     request_id=str(uuid.uuid4()),
                 )
@@ -348,7 +456,7 @@ class Segmentor:
         img_array = load_image(image)
         
         if output_formats is None:
-            output_formats = self.config.outputs.default_formats
+            output_formats = self.config.outputs.default_formats               #type: ignore
         
         if self.backend is None:
             raise BackendError("Backend not loaded")
@@ -359,17 +467,17 @@ class Segmentor:
         if boxes:
             # Validate all boxes first
             for box in boxes:
-                self._validate_box(box, img_array.shape)
+                self._validate_box(box, img_array.shape)               #type: ignore
             
             # Backend batch inference
             masks, scores = self.backend.infer_from_boxes_batch(img_array, boxes)
             
             for mask, score in zip(masks, scores):
-                mask = self._postprocess_mask(mask, img_array.shape)
+                mask = self._postprocess_mask(mask, img_array.shape)          #type: ignore
                 result = self._create_result(
                     mask=mask,
                     score=score,
-                    output_formats=output_formats,
+                    output_formats=output_formats,               #type: ignore
                     latency_ms=(time.time() - start_time) * 1000,
                     request_id=str(uuid.uuid4()),
                 )
@@ -379,17 +487,17 @@ class Segmentor:
         if points:
             # Validate all points first
             for point_list in points:
-                self._validate_points(point_list, img_array.shape)
+                self._validate_points(point_list, img_array.shape)          #type: ignore
             
             # Backend batch inference
             masks, scores = self.backend.infer_from_points_batch(img_array, points)
             
             for mask, score in zip(masks, scores):
-                mask = self._postprocess_mask(mask, img_array.shape)
+                mask = self._postprocess_mask(mask, img_array.shape)          #type: ignore
                 result = self._create_result(
                     mask=mask,
                     score=score,
-                    output_formats=output_formats,
+                    output_formats=output_formats,                   #type: ignore
                     latency_ms=(time.time() - start_time) * 1000,
                     request_id=str(uuid.uuid4()),
                 )

@@ -1,6 +1,6 @@
 """Version information for segmentor package."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.1"
 __author__ = "Tannous Geagea"
 __email__ = "tannousgeagea@hotmail.com"
 __license__ = "Apache-2.0"
