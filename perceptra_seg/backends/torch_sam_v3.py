@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from typing import Any, List, Optional, Tuple, Union
 import os
+import hashlib
 import numpy as np
 import torch
 from PIL import Image
@@ -25,6 +26,7 @@ class TorchSAMv3Backend:
         self.processor: Any = None
         self.inference_state: Any = None  # Holds the embeddings/metadata for the current image
         self.device: torch.device | None = None
+        self._cached_image_hash: str | None = None
 
     def load(self) -> None:
         """Load SAM v3 model and processor."""
@@ -68,6 +70,10 @@ class TorchSAMv3Backend:
 
     # --- Image State Management ---
 
+    def _compute_image_hash(self, image: np.ndarray) -> str:
+        """Compute hash for image caching."""
+        return hashlib.md5(image.tobytes()).hexdigest()
+
     def _update_state(self, image: Union[np.ndarray, Image.Image]) -> None:
         """
         Updates the inference state for a new image.
@@ -77,13 +83,20 @@ class TorchSAMv3Backend:
             # Convert numpy array to PIL as the official example uses PIL
             if isinstance(image, np.ndarray):
                 pil_image = Image.fromarray(image)
+                img_hash = self._compute_image_hash(image)
             else:
                 pil_image = image
+                img_hash = self._compute_image_hash(np.array(image))
+
+            # Skip if same image
+            if img_hash == self._cached_image_hash and self.inference_state is not None:
+                return
 
             # The processor returns a state object containing embeddings
             self.inference_state = self.processor.set_image(pil_image)
             self.processor.reset_all_prompts(self.inference_state)
-            
+            self._cached_image_hash = img_hash
+
         except Exception as e:
             raise BackendError(f"Failed to set image in SAM 3 processor: {e}") from e
 
@@ -107,7 +120,6 @@ class TorchSAMv3Backend:
             mask = masks[0].astype(np.uint8)
             score = float(scores[0])
 
-            print(mask.shape)
             return mask, score
 
         except Exception as e:
@@ -137,10 +149,7 @@ class TorchSAMv3Backend:
             mask = masks[0].astype(np.uint8)
             score = float(scores[0])
 
-            if mask.dtype == bool:
-                mask = mask.astype(np.uint8)
-
-            return mask, float(score)
+            return mask, score
 
         except Exception as e:
             raise BackendError(f"SAM v3 inference failed: {e}") from e
@@ -298,9 +307,7 @@ class TorchSAMv3Backend:
             for i in range(masks.shape[0]):
                 mask = masks[i, 0].cpu().numpy().astype(np.uint8)
                 mask_list.append(mask)
-                
-                score = float(scores[i, 0].cpu())
-                score_list.append(score)
+                score_list.append(float(scores[i, 0].cpu()))
             
             return mask_list, score_list
         except Exception as e:
@@ -310,32 +317,37 @@ class TorchSAMv3Backend:
         self, image: np.ndarray, points_list: list[list[tuple[int, int, int]]]
     ) -> tuple[list[np.ndarray], list[float]]:
         """Batch Point Inference."""
-        # Reuse single inference if batch API is complex/unknown, 
-        # or implement iteration over state
-        self._update_state(image)
-        
-        mask_list = []
-        score_list = []
-        
-        coords = np.array([[p[0], p[1]] for p in points_list])
-        labels = np.array([p[2] for p in points_list])
-        
-        masks, scores, _ = self.model.predict_inst(
-            self.inference_state,
-            point_coords=coords,
-            point_labels=labels,
-            multimask_output=False,
-        )
-
-
-        mask_list.append(masks[0].astype(np.uint8))
-        score_list.append(float(scores[0]))
+        try:
+            self._update_state(image)  # Once
             
-        return mask_list, score_list
+            mask_list = []
+            score_list = []
+            
+            # Iterate over each point set (SAM3 may not support multi-prompt batching)
+            for points in points_list:
+                coords = np.array([[p[0], p[1]] for p in points])
+                labels = np.array([p[2] for p in points])
+                
+                masks, scores, _ = self.model.predict_inst(
+                    self.inference_state,
+                    point_coords=coords,
+                    point_labels=labels,
+                    multimask_output=False,
+                )
+                
+                mask_list.append(masks[0].astype(np.uint8))
+                score_list.append(float(scores[0]))
+                
+            return mask_list, score_list
+            
+        except Exception as e:
+            raise BackendError(f"SAM v3 batch inference failed: {e}") from e
 
     def close(self) -> None:
         """Clean up resources."""
         self.inference_state = None
+        self._cached_image_hash = None  # Clear cache
+
         if self.model is not None:
             del self.model
         if self.processor is not None:
