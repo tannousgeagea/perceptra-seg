@@ -184,6 +184,62 @@ class TorchSAMv3Backend:
             score_list.append(float(s))
 
         return mask_list, score_list
+    
+    def infer_from_text_batch(
+        self,
+        image: np.ndarray,
+        text_prompts: List[str],
+    ) -> tuple[dict[str, list[np.ndarray]], dict[str, list[float]]]:
+        """Efficient multi-text prompt inference with shared image encoding.
+        
+        Args:
+            image: RGB image
+            text_prompts: List of text queries ["fruit", "leaf", "pipe"]
+            
+        Returns:
+            Tuple of (masks_dict, scores_dict) where keys are text prompts
+            
+        Example:
+            >>> masks, scores = backend.infer_from_text_batch(img, ["apple", "leaf"])
+            >>> # masks = {"apple": [mask1, mask2], "leaf": [mask3]}
+        """
+        try:
+            # Set image once - shared encoding for all prompts
+            self._update_state(image)
+            
+            masks_dict = {}
+            scores_dict = {}
+            
+            for text in text_prompts:
+                # Reset prompts between queries to avoid interference
+                self.processor.reset_all_prompts(self.inference_state)
+                
+                output = self.processor.set_text_prompt(
+                    state=self.inference_state,
+                    prompt=text,
+                )
+                
+                masks = output["masks"]
+                scores = output["scores"]
+                
+                # Process results
+                mask_list, score_list = [], []
+                for m, s in zip(masks, scores):
+                    if hasattr(m, "cpu"): 
+                        m = m.cpu().squeeze(0).numpy()
+                    if hasattr(s, "cpu"): 
+                        s = float(s.cpu())
+                    mask_list.append(m.astype(np.uint8))
+                    score_list.append(float(s))
+                
+                masks_dict[text] = mask_list
+                scores_dict[text] = score_list
+            
+            return masks_dict, scores_dict
+            
+        except Exception as e:
+            raise BackendError(f"SAM3 multi-text inference failed: {e}") from e
+
 
     def infer_from_exemplar_box(
         self,

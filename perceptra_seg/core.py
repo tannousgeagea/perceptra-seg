@@ -541,6 +541,135 @@ class Segmentor:
                 results.append(result)
         
         return results
+    
+    def segment_from_text_batch(
+        self,
+        image: np.ndarray | Image.Image | bytes | str | Path,
+        text_prompts: list[str],
+        *,
+        output_formats: list[str] | None = None,
+        min_score: float = 0.0,
+    ) -> dict[str, list[SegmentationResult]]:
+        """Segment multiple concepts efficiently with shared image encoding.
+        
+        Args:
+            image: Input image
+            text_prompts: List of text queries ["person", "car", "dog"]
+            output_formats: Output formats
+            min_score: Filter results below this confidence
+            
+        Returns:
+            Dict mapping text prompt to list of results
+            
+        Example:
+            >>> results = seg.segment_from_text_batch(img, ["apple", "leaf", "stem"])
+            >>> print(f"Found {len(results['apple'])} apples")
+            >>> for result in results['apple']:
+            >>>     print(f"  Score: {result.score:.2f}")
+        """
+        start_time = time.time()
+        
+        if self.backend is None:
+            raise BackendError("Backend not loaded")
+        
+        img = load_image(image)
+        
+        # Efficient batch inference with shared encoding
+        masks_dict, scores_dict = self.backend.infer_from_text_batch(img, text_prompts)
+        
+        total_latency = (time.time() - start_time) * 1000
+        
+        # Organize results by text prompt
+        results_dict = {}
+        
+        for text in text_prompts:
+            masks = masks_dict.get(text, [])
+            scores = scores_dict.get(text, [])
+            
+            per_prompt_latency = total_latency / len(text_prompts)
+            per_item_latency = per_prompt_latency / len(masks) if masks else per_prompt_latency
+            
+            results = []
+            for mask, score in zip(masks, scores):
+                # Filter by score
+                if score < min_score:
+                    continue
+                
+                mask = self._postprocess_mask(mask, img.shape)
+                result = self._create_result(
+                    mask=mask,
+                    score=score,
+                    output_formats=output_formats or self.config.outputs.default_formats,
+                    latency_ms=per_item_latency,
+                    request_id=str(uuid.uuid4()),
+                )
+                results.append(result)
+            
+            results_dict[text] = results
+        
+        return results_dict
+
+    def segment_from_text_batch_merged(
+        self,
+        image: np.ndarray | Image.Image | bytes | str | Path,
+        text_prompts: list[str],
+        *,
+        output_formats: list[str] | None = None,
+        min_score: float = 0.0,
+        iou_threshold: float = 0.8,
+    ) -> list[SegmentationResult]:
+        """Multi-text with overlap removal (NMS-style deduplication).
+        
+        Args:
+            image: Input image
+            text_prompts: List of text queries
+            min_score: Minimum confidence
+            iou_threshold: Remove masks with IoU > threshold (keeps highest score)
+            
+        Returns:
+            Flat list of deduplicated results with text labels
+            
+        Example:
+            >>> results = seg.segment_from_text_batch_merged(
+            ...     img, ["apple", "fruit"], iou_threshold=0.7
+            ... )
+        """
+        from perceptra_seg.utils.mask_utils import compute_iou
+        
+        # Get all results
+        results_dict = self.segment_from_text_batch(
+            image, text_prompts, 
+            output_formats=output_formats or ["numpy"],
+            min_score=min_score
+        )
+        
+        # Flatten with text labels
+        all_results = []
+        for text, results in results_dict.items():
+            for result in results:
+                result.text_label = text  # Add label attribute
+                all_results.append(result)
+        
+        # Sort by score (descending)
+        all_results.sort(key=lambda r: r.score, reverse=True)
+        
+        # NMS-style deduplication
+        kept = []
+        for result in all_results:
+            # Check overlap with kept results
+            should_keep = True
+            for kept_result in kept:
+                if result.mask is not None and kept_result.mask is not None:
+                    iou = compute_iou(result.mask, kept_result.mask)
+                    if iou > iou_threshold:
+                        should_keep = False
+                        break
+            
+            if should_keep:
+                kept.append(result)
+        
+        return kept
+
 
     def warmup(self, image_size: tuple[int, int] | None = None) -> None:
         """Warm up the model with a dummy forward pass.

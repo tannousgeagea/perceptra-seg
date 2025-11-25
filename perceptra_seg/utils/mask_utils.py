@@ -127,3 +127,9 @@ def apply_morphology(
     result = cv2.morphologyEx(mask.astype(np.uint8), op, kernel)
 
     return result.astype(mask.dtype)
+
+def compute_iou(mask1: np.ndarray, mask2: np.ndarray) -> float:
+    """Compute Intersection over Union between two masks."""
+    intersection = np.logical_and(mask1, mask2).sum()
+    union = np.logical_or(mask1, mask2).sum()
+    return intersection / union if union > 0 else 0.0

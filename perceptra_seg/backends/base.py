@@ -1,6 +1,6 @@
 """Base backend protocol."""
 
-from typing import Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable, List
 
 import numpy as np
 
@@ -44,6 +44,26 @@ class BaseSAMBackend(Protocol):
 
         Returns:
             Tuple of (binary_mask, confidence_score)
+        """
+        ...
+
+    def infer_from_text_batch(
+        self,
+        image: np.ndarray,
+        text_prompts: List[str],
+    ) -> tuple[dict[str, list[np.ndarray]], dict[str, list[float]]]:
+        """Efficient multi-text prompt inference with shared image encoding.
+        
+        Args:
+            image: RGB image
+            text_prompts: List of text queries ["fruit", "leaf", "pipe"]
+            
+        Returns:
+            Tuple of (masks_dict, scores_dict) where keys are text prompts
+            
+        Example:
+            >>> masks, scores = backend.infer_from_text_batch(img, ["apple", "leaf"])
+            >>> # masks = {"apple": [mask1, mask2], "leaf": [mask3]}
         """
         ...
 
