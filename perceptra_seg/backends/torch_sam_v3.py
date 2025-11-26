@@ -90,6 +90,7 @@ class TorchSAMv3Backend:
 
             # Skip if same image
             if img_hash == self._cached_image_hash and self.inference_state is not None:
+                self.processor.reset_all_prompts(self.inference_state)
                 return
 
             # The processor returns a state object containing embeddings

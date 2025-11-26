@@ -133,7 +133,7 @@ class Segmentor:
                 # Check if SAM v2 is installed
                 try:
                     ensure_dependency(
-                        package_name="sam3",
+                        package_name="perceptra_seg.vendor.sam3",
                         git_url="https://github.com/facebookresearch/sam3.git",
                         optional=True,
                     )

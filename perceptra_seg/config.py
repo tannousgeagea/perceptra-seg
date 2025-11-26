@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 class ModelConfig(BaseModel):
     """Model configuration."""
 
-    name: Literal["sam_v1", "sam_v2"] = "sam_v1"
+    name: Literal["sam_v1", "sam_v2", "sam_v3"] = "sam_v1"
     encoder_variant: Literal["vit_h", "vit_l", "vit_b"] = "vit_h"
     checkpoint_path: str | None = None
 

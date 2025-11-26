@@ -15,7 +15,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from sam3 import perflib
+from perceptra_seg.vendor.sam3 import perflib
 from perceptra_seg.vendor.sam3.logger import get_logger
 from perceptra_seg.vendor.sam3.model.box_ops import fast_diag_box_iou
 from perceptra_seg.vendor.sam3.model.data_misc import BatchedDatapoint

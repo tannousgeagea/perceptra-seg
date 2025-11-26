@@ -1,23 +1,7 @@
 from pathlib import Path
 from PIL import Image, ImageDraw
-from perceptra_seg import Segmentor
-
-
-def save_result_visuals(image, result, prefix):
-    """Helper to save mask + bounding box visualizations."""
-    # Save binary mask
-    if result.mask is not None:
-        mask_img = Image.fromarray(result.mask * 255)
-        mask_img.save(f"{prefix}_mask.png")
-        print(f"✓ Saved mask to {prefix}_mask.png")
-
-    # Save image with bbox
-    if result.bbox:
-        img_copy = image.copy()
-        draw = ImageDraw.Draw(img_copy)
-        draw.rectangle(result.bbox, outline="red", width=3)
-        img_copy.save(f"{prefix}_image.png")
-        print(f"✓ Saved image to {prefix}_image.png")
+from perceptra_seg import Segmentor, SegmentorConfig
+from perceptra_seg.utils.visualization import visualize_results
 
 
 def main():
@@ -33,9 +17,12 @@ def main():
 
     # Initialize segmentor (SAM v3)
     print("\nInitializing Segmentor...")
+    config = SegmentorConfig()
+    config.postprocess.remove_small_components = False
     seg = Segmentor(
         backend="torch",
         model="sam_v3",
+        config=config,
         device="cuda"  # change to CPU if needed
     )
 
@@ -49,12 +36,13 @@ def main():
         output_formats=["numpy", "rle", "png"]
     )
 
-    print(f"Score: {box_result.score:.3f}")
-    print(f"Area: {box_result.area}")
-    print(f"BBox: {box_result.bbox}")
-    print(f"Latency: {box_result.latency_ms:.1f}ms")
+    print(f"  -> Score: {box_result.score:.3f}")
+    print(f"  -> Area: {box_result.area}")
+    print(f"  -> BBox: {box_result.bbox}")
+    print(f"  -> Latency: {box_result.latency_ms:.1f}ms")
 
-    save_result_visuals(image, box_result, "example_box")
+    vis = visualize_results(image, [box_result], mode="both", show_scores=True)
+    vis.save("example_box.jpg")
 
     # -------------------------------------------------------------------------
     # EXAMPLE 2: Text Prompt (Concept Segmentation)
@@ -66,9 +54,14 @@ def main():
         output_formats=["numpy"]
     )
 
-    for i, r in enumerate(text_results):
-        print(f"[{i}] Score: {r.score:.3f}, Area: {r.area}, BBox: {r.bbox}")
-        save_result_visuals(image, r, f"example_text_{i}")
+    if len(text_results):
+        print(f"  -> Score: {text_results[0].score:.3f}")
+        print(f"  -> Area: {text_results[0].area}")
+        print(f"  -> BBox: {text_results[0].bbox}")
+        print(f"  -> Latency: {text_results[0].latency_ms:.1f}ms")
+
+    vis = visualize_results(image, text_results, mode="both", show_scores=True)
+    vis.save("example_text.jpg")
 
     # -------------------------------------------------------------------------
     # EXAMPLE 3: Exemplar Box (Find Similar Objects)
@@ -80,9 +73,8 @@ def main():
         output_formats=["numpy", "png"]
     )
 
-    for i, r in enumerate(exemplar_results):
-        print(f"[{i}] Score: {r.score:.3f}, Area: {r.area}, BBox: {r.bbox}")
-        save_result_visuals(image, r, f"example_exemplar_{i}")
+    vis = visualize_results(image, exemplar_results, mode="both", show_scores=True)
+    vis.save("example_exemplar.jpg")
 
     # -------------------------------------------------------------------------
     # EXAMPLE 4: Text + Box Combined Prompt
@@ -95,9 +87,8 @@ def main():
         output_formats=["numpy", "png"]
     )
 
-    for i, r in enumerate(combined_results):
-        print(f"[{i}] Score: {r.score:.3f}, Area: {r.area}, BBox: {r.bbox}")
-        save_result_visuals(image, r, f"example_text_box_{i}")
+    vis = visualize_results(image, combined_results, mode="both", show_scores=True)
+    vis.save("example_text_box.jpg")
 
 
 if __name__ == "__main__":
