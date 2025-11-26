@@ -1,7 +1,7 @@
 """Data models for Segmentor."""
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 
@@ -33,6 +33,8 @@ class SegmentationResult:
     latency_ms: float = 0.0
     model_info: dict[str, Any] = field(default_factory=dict)
     request_id: str = ""
+    text_label: Optional[str] = None  # Add this field
+    metadata: dict[str, Any] = field(default_factory=dict) 
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary, excluding None values and numpy arrays."""

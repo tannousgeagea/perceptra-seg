@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from sam3 import perflib
+from perceptra_seg.vendor.sam3 import perflib
 from perceptra_seg.vendor.sam3.logger import get_logger
 from perceptra_seg.vendor.sam3.model.act_ckpt_utils import clone_output_wrapper
 from perceptra_seg.vendor.sam3.model.box_ops import box_xywh_to_cxcywh, box_xyxy_to_xywh
