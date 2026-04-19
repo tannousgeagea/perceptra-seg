@@ -20,7 +20,7 @@ COPY config.yaml ./
 RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel
 
 # Install local package
-RUN pip3 install --no-cache-dir .[server,torch]
+RUN pip3 install --no-cache-dir .[server,torch,sam3]
 RUN pip install git+https://github.com/facebookresearch/segment-anything.git
 RUN pip install git+https://github.com/facebookresearch/segment-anything-2.git
 

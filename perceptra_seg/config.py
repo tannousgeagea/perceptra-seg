@@ -43,6 +43,8 @@ class OutputsConfig(BaseModel):
     default_formats: list[Literal["rle", "png", "polygons", "numpy"]] = ["rle"]
     include_overlay: bool = False
     min_area_ratio: float = 0.001
+    smooth_tolerance: float = 3.0   # Shapely buffer radius for polygon corner rounding
+    simplify_tolerance: float = 1.0  # Shapely simplify tolerance (vertex reduction)
 
 
 class ThresholdsConfig(BaseModel):
@@ -56,8 +58,8 @@ class PostprocessConfig(BaseModel):
     """Postprocessing configuration."""
 
     remove_small_components: bool = True
-    morphological_closing: bool = False
-    closing_kernel_size: int = 3
+    morphological_closing: bool = True
+    closing_kernel_size: int = 5
 
 
 class CacheConfig(BaseModel):

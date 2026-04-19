@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.gpu
+    env_file:
+      - .env
     environment:
       - SEGMENTOR_MODEL_NAMES=${SEG_MODELS:-sam_v2}
       - SEGMENTOR_RUNTIME_DEVICE=${SEG_DEVICE:-cuda}

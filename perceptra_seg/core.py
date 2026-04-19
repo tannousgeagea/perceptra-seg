@@ -834,7 +834,11 @@ class Segmentor:
             elif fmt == "rle":
                 result.rle = mask_to_rle(mask)
             elif fmt == "polygons":
-                result.polygons = mask_to_polygons(mask)
+                result.polygons = mask_to_polygons(
+                    mask,
+                    tolerance=self.config.outputs.simplify_tolerance,
+                    smooth_tolerance=self.config.outputs.smooth_tolerance,
+                )
             elif fmt == "png":
                 result.png_bytes = mask_to_png_bytes(mask)
 
