@@ -111,11 +111,56 @@ def decode_image(image_str: str) -> bytes:
         raise HTTPException(status_code=400, detail=f"Invalid base64 image: {e}")
 
 
+class SegmentTextRequest(BaseModel):
+    """Request for text-prompt segmentation (SAM3 only)."""
+
+    image: str = Field(..., description="Base64-encoded image or URL")
+    text: str = Field(..., min_length=1, max_length=500, description="Natural language prompt")
+    output_formats: list[str] = Field(default=["rle", "polygons"])
+
+
+class SegmentExemplarRequest(BaseModel):
+    """Request for exemplar-based similarity search (SAM3 only)."""
+
+    image: str = Field(..., description="Base64-encoded image or URL")
+    exemplar_box: list[int] = Field(..., min_length=4, max_length=4, description="[x1, y1, x2, y2] pixel coords")
+    output_formats: list[str] = Field(default=["rle", "polygons"])
+
+
+class SegmentAutoRequest(BaseModel):
+    """Request for automatic full-image segmentation."""
+
+    image: str = Field(..., description="Base64-encoded image or URL")
+    points_per_side: int = Field(default=32, ge=8, le=64)
+    pred_iou_thresh: float = Field(default=0.88, ge=0.0, le=1.0)
+    stability_score_thresh: float = Field(default=0.95, ge=0.0, le=1.0)
+    output_formats: list[str] = Field(default=["rle", "polygons"])
+
+
 # Routes
 @router.get("/healthz")
-async def health_check() -> dict[str, str]:
-    """Health check endpoint."""
-    return {"status": "ok"}
+async def health_check(request: Request) -> dict[str, Any]:
+    """Health check endpoint with model info."""
+    segmentor = request.app.state.segmentor
+    model_loaded = segmentor is not None
+
+    gpu_memory_mb = None
+    try:
+        import torch
+        if torch.cuda.is_available() and model_loaded:
+            gpu_memory_mb = round(torch.cuda.memory_allocated() / 1024 / 1024, 1)
+    except Exception:
+        pass
+
+    config = request.app.state.config
+    return {
+        "status": "ok" if model_loaded else "degraded",
+        "model_loaded": model_loaded,
+        "model_name": config.model.name if config else None,
+        "device": config.runtime.device if config else None,
+        "precision": config.runtime.precision if config else None,
+        "gpu_memory_used_mb": gpu_memory_mb,
+    }
 
 
 @router.post("/segment/box", response_model=SegmentationResponse)
@@ -176,6 +221,80 @@ async def segment_points(
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         logger.exception("Unexpected error in segment_points")
+        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
+
+
+@router.post("/segment/text", response_model=list[SegmentationResponse])
+async def segment_text(
+    request: SegmentTextRequest,
+    segmentor: Any = Depends(get_segmentor),
+    _auth: None = Depends(verify_api_key),
+) -> list[dict[str, Any]]:
+    """Segment objects matching a text prompt (SAM3 only)."""
+    try:
+        image_data = decode_image(request.image)
+        results = segmentor.segment_from_text(
+            image=image_data,
+            text=request.text,
+            output_formats=request.output_formats,
+        )
+        return [r.to_dict() for r in results]
+    except InvalidPromptError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except SegmentorError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.exception("Unexpected error in segment_text")
+        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
+
+
+@router.post("/segment/exemplar", response_model=list[SegmentationResponse])
+async def segment_exemplar(
+    request: SegmentExemplarRequest,
+    segmentor: Any = Depends(get_segmentor),
+    _auth: None = Depends(verify_api_key),
+) -> list[dict[str, Any]]:
+    """Find all objects visually similar to the exemplar box (SAM3 only)."""
+    try:
+        image_data = decode_image(request.image)
+        results = segmentor.segment_from_exemplar_box(
+            image=image_data,
+            box=tuple(request.exemplar_box),
+            output_formats=request.output_formats,
+        )
+        return [r.to_dict() for r in results]
+    except InvalidPromptError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except SegmentorError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.exception("Unexpected error in segment_exemplar")
+        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
+
+
+@router.post("/segment/auto", response_model=list[SegmentationResponse])
+async def segment_auto(
+    request: SegmentAutoRequest,
+    segmentor: Any = Depends(get_segmentor),
+    _auth: None = Depends(verify_api_key),
+) -> list[dict[str, Any]]:
+    """Auto-segment entire image with no prompts (SAM v1/v2 only)."""
+    try:
+        image_data = decode_image(request.image)
+        results = segmentor.segment_auto(
+            image=image_data,
+            points_per_side=request.points_per_side,
+            pred_iou_thresh=request.pred_iou_thresh,
+            stability_score_thresh=request.stability_score_thresh,
+            output_formats=request.output_formats,
+        )
+        return [r.to_dict() for r in results]
+    except InvalidPromptError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except SegmentorError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.exception("Unexpected error in segment_auto")
         raise HTTPException(status_code=500, detail=f"Internal error: {e}")
 
 

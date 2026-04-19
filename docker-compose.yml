@@ -1,0 +1,21 @@
+services:
+  perceptra-seg:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    environment:
+      - SEGMENTOR_MODEL_NAME=${SEG_MODEL:-sam_v2}
+      - SEGMENTOR_RUNTIME_DEVICE=${SEG_DEVICE:-cuda}
+      - SEGMENTOR_RUNTIME_PRECISION=${SEG_PRECISION:-fp16}
+      - SEGMENTOR_SERVER_API_KEYS=${SEG_API_KEYS:-}
+    ports:
+      - "29086:8080"
+    restart: unless-stopped
+    image: tannousgeagea/perceptra-seg:latest
+    container_name: perceptra-seg
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8080/v1/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3

@@ -720,6 +720,73 @@ class Segmentor:
             if label not in (0, 1):
                 raise InvalidPromptError(f"Point label must be 0 or 1, got {label}")
 
+    def segment_auto(
+        self,
+        image: "np.ndarray | Image.Image | bytes | str | Path",
+        *,
+        points_per_side: int = 32,
+        pred_iou_thresh: float = 0.88,
+        stability_score_thresh: float = 0.95,
+        output_formats: "list[str] | None" = None,
+    ) -> "list[SegmentationResult]":
+        """Auto-segment entire image — no prompts required.
+
+        Uses SamAutomaticMaskGenerator (v1/v2) to generate all masks.
+        Only supported for torch_sam_v1 and torch_sam_v2 backends.
+
+        Args:
+            image: Input image
+            points_per_side: Grid density for automatic point sampling
+            pred_iou_thresh: Minimum predicted IoU to keep a mask
+            stability_score_thresh: Minimum stability score to keep a mask
+            output_formats: List of output formats
+
+        Returns:
+            List of SegmentationResult, one per detected object
+        """
+        start_time = time.time()
+
+        if self.backend is None:
+            raise BackendError("Backend not loaded")
+
+        if not hasattr(self.backend, "generate_all"):
+            raise BackendError(
+                f"Auto-segmentation not supported by backend '{self.config.runtime.backend}_{self.config.model.name}'. "
+                "Use torch_sam_v1 or torch_sam_v2."
+            )
+
+        img_array = load_image(image)
+
+        if output_formats is None:
+            output_formats = self.config.outputs.default_formats  # type: ignore
+
+        raw_masks = self.backend.generate_all(
+            img_array,
+            points_per_side=points_per_side,
+            pred_iou_thresh=pred_iou_thresh,
+            stability_score_thresh=stability_score_thresh,
+        )
+
+        results = []
+        total_latency = (time.time() - start_time) * 1000
+        per_item_latency = total_latency / len(raw_masks) if raw_masks else total_latency
+
+        for mask_data in raw_masks:
+            mask = mask_data["segmentation"].astype(np.uint8)
+            score = float(mask_data.get("predicted_iou", mask_data.get("stability_score", 0.9)))
+
+            mask = self._postprocess_mask(mask, img_array.shape)  # type: ignore
+            result = self._create_result(
+                mask=mask,
+                score=score,
+                output_formats=output_formats,  # type: ignore
+                latency_ms=per_item_latency,
+                request_id=str(uuid.uuid4()),
+            )
+            results.append(result)
+
+        return results
+
     def _postprocess_mask(self, mask: np.ndarray, image_shape: tuple[int, int, int]) -> np.ndarray:
         """Apply postprocessing to mask."""
         if self.config.postprocess.remove_small_components:

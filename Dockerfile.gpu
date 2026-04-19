@@ -1,30 +1,35 @@
-# GPU-enabled Dockerfile
-FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+# GPU-enabled Dockerfile — PyTorch + CUDA + cuDNN pre-installed
+FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-runtime
 
 WORKDIR /app
 
-# Install Python
-RUN apt-get update && apt-get install -y \
-    python3.11 \
-    python3-pip \
+# System deps for OpenCV (libgl1 / libglib2)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Set Python 3.11 as default
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
-RUN update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
+# Install other necessary packages and dependencies
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -q -y --no-install-recommends \
+    apt-utils \
+	vim \
+	git \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy files
+# Copy source
 COPY pyproject.toml ./
-COPY segmentor/ ./segmentor/
+COPY perceptra_seg/ ./perceptra_seg/
 COPY service/ ./service/
 COPY config.yaml ./
 
-# Install package with GPU support
-RUN pip install --no-cache-dir -e .[server,torch]
+# Upgrade build tools, then install — torch already present in base image
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# Create non-root user
+RUN pip install --no-cache-dir .[server,torch]
+RUN pip install git+https://github.com/facebookresearch/segment-anything.git
+RUN pip install git+https://github.com/facebookresearch/segment-anything-2.git
+
+# Non-root user
 RUN useradd -m -u 1000 segmentor && chown -R segmentor:segmentor /app
 USER segmentor
 

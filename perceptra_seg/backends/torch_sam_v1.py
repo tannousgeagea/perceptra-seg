@@ -254,6 +254,27 @@ class TorchSAMv1Backend:
         raise NotImplementedError
 
 
+    def generate_all(
+        self,
+        image: np.ndarray,
+        points_per_side: int = 32,
+        pred_iou_thresh: float = 0.88,
+        stability_score_thresh: float = 0.95,
+    ) -> list[dict]:
+        """Auto-segment entire image without explicit prompts."""
+        try:
+            from segment_anything import SamAutomaticMaskGenerator  # type: ignore
+
+            mask_generator = SamAutomaticMaskGenerator(
+                self.predictor.model,  # type: ignore
+                points_per_side=points_per_side,
+                pred_iou_thresh=pred_iou_thresh,
+                stability_score_thresh=stability_score_thresh,
+            )
+            return mask_generator.generate(image)
+        except Exception as e:
+            raise BackendError(f"SAM v1 auto-segmentation failed: {e}") from e
+
     def close(self) -> None:
         """Clean up resources."""
         if self.predictor is not None:
