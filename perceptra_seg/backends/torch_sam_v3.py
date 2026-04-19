@@ -31,7 +31,6 @@ class TorchSAMv3Backend:
     def load(self) -> None:
         """Load SAM v3 model and processor."""
         try:
-            # Official imports based on your snippet
             import perceptra_seg.vendor.sam3 as sam3
             from perceptra_seg.vendor.sam3.model_builder import build_sam3_image_model
             from perceptra_seg.vendor.sam3.model.sam3_image_processor import Sam3Processor
@@ -40,33 +39,49 @@ class TorchSAMv3Backend:
             device_str = self.config.runtime.device
             self.device = torch.device(device_str if torch.cuda.is_available() else "cpu")
 
-            # We assume build_sam3_image_model accepts a checkpoint path or config
-            # If the official repo allows argument-less build, it likely downloads default or uses internal config
-            checkpoint_path = self._get_checkpoint_path(sam3_root)
-            
+            bpe_path = os.path.join(sam3_root, "assets", "bpe_simple_vocab_16e6.txt.gz")
+            checkpoint_path = self._resolve_checkpoint()
+            load_from_hf = checkpoint_path is None
 
-            print(f"Device: {self.device}")
-            logger.info(f"Building SAM 3 Image Model from {checkpoint_path}...")
+            logger.info(
+                "Building SAM3 model — checkpoint: %s",
+                checkpoint_path or "HuggingFace (facebook/sam3)",
+            )
             self.model = build_sam3_image_model(
-                bpe_path=checkpoint_path,
+                bpe_path=bpe_path,
+                checkpoint_path=checkpoint_path,
+                load_from_HF=load_from_hf,
                 enable_inst_interactivity=True,
-                # device=self.device
             )
 
-            # Initialize the Processor
             self.processor = Sam3Processor(self.model)
-            logger.info("SAM 3 Processor initialized.")
+            logger.info("SAM3 Processor initialized.")
 
         except ImportError:
             raise ModelLoadError(
-                "SAM 3 package not found. Ensure 'sam3' is installed from the official repo."
+                "SAM3 package not found. Ensure the sam3 extras are installed."
             )
         except Exception as e:
             raise ModelLoadError(f"Failed to load SAM v3: {e}") from e
 
-    def _get_checkpoint_path(self, sam3_root:str) -> Optional[str]:
-        """Get checkpoint path from config."""
-        return self.config.model.checkpoint_path or f"{sam3_root}/assets/bpe_simple_vocab_16e6.txt.gz"
+    def _resolve_checkpoint(self) -> Optional[str]:
+        """Return a local checkpoint path, or None to trigger HF download.
+
+        Resolution order:
+          1. config.model.checkpoint_path (explicit override)
+          2. SEGMENTOR_SAM3_CHECKPOINT env var
+          3. /opt/models/sam3.pt  (baked in at Docker build time via scripts/download_sam3.py)
+        If none of the above exists, returns None → build_sam3_image_model downloads from HF.
+        """
+        candidates = [
+            self.config.model.checkpoint_path,
+            os.environ.get("SEGMENTOR_SAM3_CHECKPOINT"),
+            "/opt/models/sam3.pt",
+        ]
+        for path in candidates:
+            if path and os.path.isfile(path):
+                return path
+        return None
 
     # --- Image State Management ---
 
