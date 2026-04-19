@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile.gpu
     environment:
-      - SEGMENTOR_MODEL_NAME=${SEG_MODEL:-sam_v2}
+      - SEGMENTOR_MODEL_NAMES=${SEG_MODELS:-sam_v2}
       - SEGMENTOR_RUNTIME_DEVICE=${SEG_DEVICE:-cuda}
       - SEGMENTOR_RUNTIME_PRECISION=${SEG_PRECISION:-fp16}
       - SEGMENTOR_SERVER_API_KEYS=${SEG_API_KEYS:-}

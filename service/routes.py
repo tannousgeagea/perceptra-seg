@@ -5,7 +5,7 @@ import logging
 import time
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from perceptra_seg.exceptions import InvalidPromptError, SegmentorError
@@ -67,11 +67,26 @@ class SegmentationResponse(BaseModel):
 
 
 # Dependency functions
-async def get_segmentor(request: Request) -> Any:
-    """Get Segmentor instance from app state."""
-    if not request.app.state.segmentor:
-        raise HTTPException(status_code=503, detail="Segmentor not initialized")
-    return request.app.state.segmentor
+async def get_segmentor(
+    request: Request,
+    model: str | None = Query(
+        None,
+        description="Model to use (e.g. 'sam_v2', 'sam_v3'). Omit to use the primary model.",
+    ),
+) -> Any:
+    """Resolve and return the requested Segmentor instance."""
+    models: dict = getattr(request.app.state, "models", {})
+    if not models:
+        raise HTTPException(status_code=503, detail="No models loaded")
+
+    model_name = model or getattr(request.app.state, "primary_model", None)
+    segmentor = models.get(model_name)
+    if segmentor is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model '{model_name}' is not loaded. Available: {sorted(models.keys())}",
+        )
+    return segmentor
 
 
 async def verify_api_key(request: Request) -> None:
@@ -140,26 +155,37 @@ class SegmentAutoRequest(BaseModel):
 # Routes
 @router.get("/healthz")
 async def health_check(request: Request) -> dict[str, Any]:
-    """Health check endpoint with model info."""
-    segmentor = request.app.state.segmentor
-    model_loaded = segmentor is not None
+    """Health check endpoint — reports all loaded models."""
+    models: dict = getattr(request.app.state, "models", {})
+    primary: str | None = getattr(request.app.state, "primary_model", None)
 
-    gpu_memory_mb = None
     try:
         import torch
-        if torch.cuda.is_available() and model_loaded:
-            gpu_memory_mb = round(torch.cuda.memory_allocated() / 1024 / 1024, 1)
+        gpu_total_mb = round(torch.cuda.memory_allocated() / 1024 / 1024, 1) if torch.cuda.is_available() else None
     except Exception:
-        pass
+        gpu_total_mb = None
 
-    config = request.app.state.config
+    models_info = {
+        name: {
+            "loaded": True,
+            "device": seg.config.runtime.device,
+            "precision": seg.config.runtime.precision,
+        }
+        for name, seg in models.items()
+    }
+
+    # Backward-compat flat fields for the primary model
+    primary_seg = models.get(primary) if primary else None
     return {
-        "status": "ok" if model_loaded else "degraded",
-        "model_loaded": model_loaded,
-        "model_name": config.model.name if config else None,
-        "device": config.runtime.device if config else None,
-        "precision": config.runtime.precision if config else None,
-        "gpu_memory_used_mb": gpu_memory_mb,
+        "status": "ok" if models else "degraded",
+        "primary_model": primary,
+        "models": models_info,
+        "gpu_memory_used_mb": gpu_total_mb,
+        # legacy fields
+        "model_loaded": bool(models),
+        "model_name": primary,
+        "device": primary_seg.config.runtime.device if primary_seg else None,
+        "precision": primary_seg.config.runtime.precision if primary_seg else None,
     }
 
 
