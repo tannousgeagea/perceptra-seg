@@ -3,6 +3,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.gpu
+      args:
+        # Provide your HuggingFace token to pre-download the SAM3 checkpoint at
+        # build time (avoids requiring auth every time the container starts).
+        # Set HF_TOKEN in your .env file or shell before running docker-compose build.
+        HF_TOKEN: ${HF_TOKEN:-}
     env_file:
       - .env
     environment:

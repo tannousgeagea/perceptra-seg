@@ -20,6 +20,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -q -y --no-
 COPY pyproject.toml ./
 COPY perceptra_seg/ ./perceptra_seg/
 COPY service/ ./service/
+COPY scripts/ ./scripts/
 COPY config.yaml ./
 
 # Upgrade build tools, then install — torch already present in base image
@@ -29,8 +30,16 @@ RUN pip install --no-cache-dir .[server,torch,sam3]
 RUN pip install git+https://github.com/facebookresearch/segment-anything.git
 RUN pip install git+https://github.com/facebookresearch/segment-anything-2.git
 
-# Non-root user
-RUN useradd -m -u 1000 segmentor && chown -R segmentor:segmentor /app
+# Pre-download SAM3 checkpoint at build time so no HF auth is needed at runtime.
+# Pass --build-arg HF_TOKEN=<your_token> to enable; omit to skip (runtime download fallback).
+ARG HF_TOKEN=""
+RUN mkdir -p /opt/models && \
+    HF_TOKEN=$HF_TOKEN python scripts/download_sam3.py
+
+# Non-root user — give segmentor read access to the pre-downloaded model
+RUN useradd -m -u 1000 segmentor \
+    && chown -R segmentor:segmentor /app \
+    && chown -R segmentor:segmentor /opt/models
 USER segmentor
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s \
