@@ -1,35 +1,38 @@
-# CPU-only Dockerfile
-FROM python:3.11-slim
+# GPU-enabled Dockerfile — PyTorch + CUDA + cuDNN pre-installed
+FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-runtime
 
 WORKDIR /app
 
-# Install system dependencies
+# System deps for OpenCV (libgl1 / libglib2)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
     libglib2.0-0 \
-    git \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements
+# Install other necessary packages and dependencies
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -q -y --no-install-recommends \
+    apt-utils \
+	vim \
+	git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy source
 COPY pyproject.toml ./
 COPY perceptra_seg/ ./perceptra_seg/
 COPY service/ ./service/
 COPY config.yaml ./
 
-# Upgrade build tools first so setuptools supports PEP 660 (build_editable)
-RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel
+# Upgrade build tools, then install — torch already present in base image
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# Install local package
-RUN pip3 install --no-cache-dir .[server,torch,sam3]
+RUN pip install --no-cache-dir .[server,torch,sam3]
 RUN pip install git+https://github.com/facebookresearch/segment-anything.git
 RUN pip install git+https://github.com/facebookresearch/segment-anything-2.git
 
-
-# Create non-root user
+# Non-root user
 RUN useradd -m -u 1000 segmentor && chown -R segmentor:segmentor /app
 USER segmentor
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s \
     CMD python -c "import requests; requests.get('http://localhost:8080/v1/healthz')"
 
