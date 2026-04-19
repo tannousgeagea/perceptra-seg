@@ -36,6 +36,7 @@ jobs:
       uses: docker/build-push-action@v3
       with:
         context: .
+        dockerfile: Dockerfile.gpu
         push: true
         tags: |
           tannousgeagea/perceptra-seg:${{ env.RELEASE_TAG }}
