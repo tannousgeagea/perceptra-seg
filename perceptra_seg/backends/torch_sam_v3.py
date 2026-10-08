@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from perceptra_seg.backends._common import split_masks as _split_masks
 from perceptra_seg.config import SegmentorConfig
 from perceptra_seg.exceptions import BackendError, ModelLoadError
 
@@ -27,30 +28,6 @@ logger = logging.getLogger(__name__)
 
 # Legacy location used by older images that baked the checkpoint in at build time.
 _LEGACY_CHECKPOINT = "/opt/models/sam3.pt"
-
-
-def _to_numpy(x: Any) -> np.ndarray:
-    if isinstance(x, torch.Tensor):
-        return x.detach().float().cpu().numpy()
-    return np.asarray(x)
-
-
-def _split_masks(masks: Any, scores: Any) -> tuple[list[np.ndarray], list[float]]:
-    """Flatten predictor/processor output into per-object (HxW uint8 mask, score) pairs.
-
-    Handles the shapes produced by upstream sam3: ``(H, W)``, ``(N, H, W)`` and
-    ``(N, 1, H, W)`` masks with matching ``()``, ``(N,)`` or ``(N, 1)`` scores.
-    """
-    masks_np = _to_numpy(masks)
-    scores_np = _to_numpy(scores).reshape(-1)
-    if masks_np.ndim == 2:
-        masks_np = masks_np[None]
-    if masks_np.ndim == 4:
-        masks_np = masks_np[:, 0]
-    return (
-        [(m > 0).astype(np.uint8) for m in masks_np],
-        [float(s) for s in scores_np[: len(masks_np)]],
-    )
 
 
 def _xyxy_to_norm_cxcywh(box: tuple[int, int, int, int], w: int, h: int) -> list[float]:
