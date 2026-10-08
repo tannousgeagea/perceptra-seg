@@ -98,10 +98,10 @@ class TorchSAMv3Backend:
                 self.device,
                 checkpoint_path or "HuggingFace (facebook/sam3)",
             )
-            if self.device.type == "cuda":
-                # Upstream allocates some buffers on the bare "cuda" device; make that
-                # resolve to the configured GPU (e.g. cuda:1).
-                torch.cuda.set_device(self.device)
+            # if self.device.type == "cuda":
+            #     # Upstream allocates some buffers on the bare "cuda" device; make that
+            #     # resolve to the configured GPU (e.g. cuda:1).
+            #     torch.cuda.set_device(self.device)
             self.model = build_sam3_image_model(
                 bpe_path=self._bpe_path(),
                 device=self.device.type,
