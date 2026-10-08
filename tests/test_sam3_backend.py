@@ -54,3 +54,15 @@ def test_explicit_checkpoint_must_exist(tmp_path) -> None:
     ckpt.write_bytes(b"x")
     cfg.model.checkpoint_path = str(ckpt)
     assert TorchSAMv3Backend(cfg)._resolve_checkpoint() == str(ckpt)
+
+
+@pytest.mark.parametrize("requested, expected", [("cuda", "cuda:0"), ("cuda:1", "cuda:1")])
+def test_cuda_device_gets_explicit_index(monkeypatch: pytest.MonkeyPatch, requested, expected) -> None:
+    # torch.cuda.set_device rejects an index-less "cuda" device.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    cfg = SegmentorConfig()
+    cfg.runtime.device = requested
+    device = TorchSAMv3Backend(cfg)._resolve_device()
+    assert str(device) == expected
+    assert device.index is not None

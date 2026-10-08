@@ -127,6 +127,8 @@ class TorchSAMv3Backend:
                 f"SAM3 requires a CUDA GPU (runtime.device={self.config.runtime.device!r}, "
                 f"cuda available={torch.cuda.is_available()})"
             )
+        if requested.index is None:  # plain "cuda" -> explicit index for set_device
+            requested = torch.device("cuda", torch.cuda.current_device())
         return requested
 
     @staticmethod
