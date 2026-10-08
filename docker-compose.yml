@@ -1,28 +1,48 @@
+# perceptra-seg segmentation service.
+#
+#   cp .env.example .env   # set HF_TOKEN (SAM3 weights are gated), API keys, models
+#   docker compose up -d --build
+#   curl http://localhost:29086/v1/healthz
+#
+# Requires the NVIDIA Container Toolkit on the host.
 services:
   perceptra-seg:
+    image: ${SEG_IMAGE:-tannousgeagea/perceptra-seg:latest}
     build:
       context: .
-      dockerfile: Dockerfile.gpu
       args:
-        # Provide your HuggingFace token to pre-download the SAM3 checkpoint at
-        # build time (avoids requiring auth every time the container starts).
-        # Set HF_TOKEN in your .env file or shell before running docker-compose build.
-        HF_TOKEN: ${HF_TOKEN:-}
-    env_file:
-      - .env
-    environment:
-      - SEGMENTOR_MODEL_NAMES=${SEG_MODELS:-sam_v2}
-      - SEGMENTOR_RUNTIME_DEVICE=${SEG_DEVICE:-cuda}
-      - SEGMENTOR_RUNTIME_PRECISION=${SEG_PRECISION:-fp16}
-      - SEGMENTOR_SERVER_API_KEYS=${SEG_API_KEYS:-}
-    ports:
-      - "29086:8080"
-    restart: unless-stopped
-    image: tannousgeagea/perceptra-seg:latest
+        # Upstream facebookresearch/sam3 ref. "main" = latest; set a commit SHA to pin.
+        SAM3_REF: ${SAM3_REF:-main}
     container_name: perceptra-seg
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      SEGMENTOR_MODEL_NAMES: ${SEG_MODELS:-sam_v3}
+      SEGMENTOR_RUNTIME_DEVICE: ${SEG_DEVICE:-cuda}
+      SEGMENTOR_RUNTIME_PRECISION: ${SEG_PRECISION:-fp16}
+      SEGMENTOR_SERVER_API_KEYS: ${SEG_API_KEYS:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+    ports:
+      - "${SEG_PORT:-29086}:8080"
+    volumes:
+      # Model weights (HF cache + SAM v1/v2 checkpoints) survive restarts and rebuilds.
+      - models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${SEG_GPU:-0}"]
+              capabilities: [gpu]
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8080/v1/healthz', timeout=5)"]
+      test: ["CMD", "python", "-c", "import json,sys,urllib.request; sys.exit(json.load(urllib.request.urlopen('http://localhost:8080/v1/healthz', timeout=5))['status'] != 'ok')"]
       interval: 30s
       timeout: 10s
-      start_period: 90s
+      # First start downloads weights (SAM3 ~3.5 GB) before the API comes up.
+      start_period: 600s
       retries: 3
+
+volumes:
+  models:

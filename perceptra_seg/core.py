@@ -1,6 +1,7 @@
 """Core Segmentor class."""
 
 import hashlib
+import importlib.util
 import logging
 import time
 import uuid
@@ -12,11 +13,15 @@ from PIL import Image
 
 from perceptra_seg.backends.base import BaseSAMBackend
 from perceptra_seg.config import SegmentorConfig
-from perceptra_seg.exceptions import BackendError, InvalidPromptError, ModelLoadError
+from perceptra_seg.exceptions import (
+    BackendError,
+    InvalidPromptError,
+    ModelLoadError,
+    UnsupportedOperationError,
+)
 from perceptra_seg.models import SegmentationResult
 from perceptra_seg.utils.cache import EmbeddingCache
 from perceptra_seg.utils.image_io import load_image
-from perceptra_seg.utils.dependency_check import ensure_dependency
 from perceptra_seg.utils.mask_utils import (
     apply_morphology,
     mask_to_png_bytes,
@@ -28,8 +33,14 @@ from perceptra_seg.utils.mask_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _require(module: str, pip_spec: str) -> None:
+    """Fail fast with an install hint if an optional model package is missing."""
+    if importlib.util.find_spec(module) is None:
+        raise ModelLoadError(f"'{module}' is not installed. Install it with:\n  pip install \"{pip_spec}\"")
+
+
 class Segmentor:
-    """Main segmentation interface supporting SAM v1 and v2.
+    """Main segmentation interface supporting SAM v1, v2 and v3.
 
     Args:
         config: SegmentorConfig instance or None to use defaults
@@ -97,53 +108,19 @@ class Segmentor:
 
         try:
             if backend_key == "torch_sam_v1":
-                # Check if SAM v1 is installed
-                try:
-                    ensure_dependency(
-                        package_name="segment_anything",
-                        git_url="https://github.com/facebookresearch/segment-anything.git",
-                        optional=False,
-                    )
-                except ImportError:
-                    raise ModelLoadError(
-                        "SAM v1 not found. Install it with:\n"
-                        "  pip install git+https://github.com/facebookresearch/segment-anything.git"
-                    )
-                
+                _require("segment_anything", "git+https://github.com/facebookresearch/segment-anything.git")
                 from perceptra_seg.backends.torch_sam_v1 import TorchSAMv1Backend
+
                 self.backend = TorchSAMv1Backend(self.config)
-                
             elif backend_key == "torch_sam_v2":
-                # Check if SAM v2 is installed
-                try:
-                    ensure_dependency(
-                        package_name="sam2",
-                        git_url="https://github.com/facebookresearch/segment-anything-2.git",
-                        optional=False,
-                    )
-                except ImportError:
-                    raise ModelLoadError(
-                        "SAM v2 not found. Install it with:\n"
-                        "  pip install git+https://github.com/facebookresearch/segment-anything-2.git"
-                    )
-                
+                _require("sam2", "git+https://github.com/facebookresearch/sam2.git")
                 from perceptra_seg.backends.torch_sam_v2 import TorchSAMv2Backend
+
                 self.backend = TorchSAMv2Backend(self.config)
             elif backend_key == "torch_sam_v3":
-                # Check if SAM v2 is installed
-                try:
-                    ensure_dependency(
-                        package_name="perceptra_seg.vendor.sam3",
-                        git_url="https://github.com/facebookresearch/sam3.git",
-                        optional=True,
-                    )
-                except ImportError:
-                    raise ModelLoadError(
-                        "SAM v3 not found. Install it with:\n"
-                        "  pip install git+https://github.com/facebookresearch/sam3.git"
-                    )
-                
+                _require("sam3", "git+https://github.com/facebookresearch/sam3.git")
                 from perceptra_seg.backends.torch_sam_v3 import TorchSAMv3Backend
+
                 self.backend = TorchSAMv3Backend(self.config)
             elif backend_key == "onnx_sam_v1":
                 from perceptra_seg.backends.onnx_sam_v1 import ONNXSAMv1Backend
@@ -282,7 +259,7 @@ class Segmentor:
 
         img = load_image(image)
 
-        masks, scores = self.backend.infer_from_text(img, text)
+        masks, scores = self._backend_method("infer_from_text")(img, text)
         total_latency = (time.time() - start_time) * 1000
         per_item_latency = total_latency / len(masks) if masks else total_latency
 
@@ -316,7 +293,7 @@ class Segmentor:
         img = load_image(image)
         self._validate_box(box, img.shape)    #type: ignore
 
-        masks, scores = self.backend.infer_from_exemplar_box(img, box)
+        masks, scores = self._backend_method("infer_from_exemplar_box")(img, box)
         total_latency = (time.time() - start_time) * 1000
         per_item_latency = total_latency / len(masks) if masks else total_latency
 
@@ -351,7 +328,7 @@ class Segmentor:
         img = load_image(image)
         self._validate_box(box, img.shape)  # type: ignore
 
-        masks, scores = self.backend.infer_from_text_and_box(img, text, box)
+        masks, scores = self._backend_method("infer_from_text_and_box")(img, text, box)
         total_latency = (time.time() - start_time) * 1000
         per_item_latency = total_latency / len(masks) if masks else total_latency
 
@@ -396,62 +373,44 @@ class Segmentor:
             List of SegmentationResult instances
         """
         if not any([boxes, points, text, exemplar_box]):
-            raise InvalidPromptError("Must provide either boxes or points")
+            raise InvalidPromptError("Must provide at least one of boxes, points, text or exemplar_box")
 
-        if boxes and not points:
-            results = self.segment_batch(
-                image, boxes=boxes, output_formats=output_formats, return_overlay=return_overlay
+        image = load_image(image)  # decode/fetch once for all prompt types
+        results: list[SegmentationResult] = []
+        if boxes or points:
+            results.extend(
+                self.segment_batch(
+                    image,
+                    boxes=boxes,
+                    points=[points] if points else None,
+                    output_formats=output_formats,
+                    return_overlay=return_overlay,
+                )
             )
-
-        elif points and not boxes:
-            results = self.segment_batch(
-                image, points=[points], output_formats=output_formats, return_overlay=return_overlay
+        # Semantic prompts (SAM3)
+        if text:
+            results.extend(self.segment_from_text(image, text, output_formats=output_formats))
+        if exemplar_box:
+            results.extend(
+                self.segment_from_exemplar_box(image, exemplar_box, output_formats=output_formats)
             )
-        else:
-            # Mixed prompts - combine batch results
-            results = []
-            if boxes:
-                results.extend(
-                    self.segment_batch(image, boxes=boxes, output_formats=output_formats)
-                )
-            if points:
-                results.extend(
-                    self.segment_batch(image, points=[points], output_formats=output_formats)
-                )
-            # Semantic prompts (SAM3)
-            if text:
-                results.extend(
-                    self.segment_from_text(image, text, output_formats=output_formats)
-                )
-            
-            if exemplar_box:
-                results.extend(
-                    self.segment_from_exemplar_box(image, exemplar_box, output_formats=output_formats)
-                )
 
         # Apply strategy
         if strategy == "largest" and len(results) > 1:
-            largest = max(results, key=lambda r: r.area)
-            return [largest]
-        elif strategy == "merge" and len(results) > 1:
-            # Validate first result has mask
-            if results[0].mask is None:
+            return [max(results, key=lambda r: r.area)]
+        if strategy == "merge" and len(results) > 1:
+            if any(r.mask is None for r in results):
                 raise BackendError("Cannot merge: numpy format required. Add 'numpy' to output_formats")
-            
-            merged_mask = results[0].mask.copy()
-            for r in results[1:]:
-                if r.mask is not None:
-                    merged_mask = np.logical_or(merged_mask, r.mask)
-
-                # Create merged result
-                merged_result = self._create_result(
+            merged_mask = np.logical_or.reduce([r.mask for r in results])
+            return [
+                self._create_result(
                     mask=merged_mask.astype(np.uint8),
-                    score=np.mean([r.score for r in results]),              #type: ignore
-                    output_formats=output_formats or self.config.outputs.default_formats,          #type: ignore
+                    score=float(np.mean([r.score for r in results])),
+                    output_formats=output_formats or self.config.outputs.default_formats,  # type: ignore
                     latency_ms=sum(r.latency_ms for r in results),
                     request_id=str(uuid.uuid4()),
                 )
-                return [merged_result]
+            ]
 
         return results
 
@@ -575,7 +534,7 @@ class Segmentor:
         img = load_image(image)
         
         # Efficient batch inference with shared encoding
-        masks_dict, scores_dict = self.backend.infer_from_text_batch(img, text_prompts)
+        masks_dict, scores_dict = self._backend_method("infer_from_text_batch")(img, text_prompts)
         
         total_latency = (time.time() - start_time) * 1000
         
@@ -696,6 +655,18 @@ class Segmentor:
             self.backend.close()
             self.backend = None
 
+    def _backend_method(self, name: str) -> Any:
+        """Return a backend capability, or raise if the loaded model lacks it."""
+        if self.backend is None:
+            raise BackendError("Backend not loaded")
+        method = getattr(self.backend, name, None)
+        if method is None:
+            raise UnsupportedOperationError(
+                f"'{self.config.runtime.backend}_{self.config.model.name}' does not support {name}; "
+                "text/exemplar prompts require sam_v3, auto-segmentation requires sam_v1/sam_v2"
+            )
+        return method
+
     def _validate_box(
         self, box: tuple[int, int, int, int], image_shape: tuple[int, int, int]
     ) -> None:
@@ -749,18 +720,12 @@ class Segmentor:
         if self.backend is None:
             raise BackendError("Backend not loaded")
 
-        if not hasattr(self.backend, "generate_all"):
-            raise BackendError(
-                f"Auto-segmentation not supported by backend '{self.config.runtime.backend}_{self.config.model.name}'. "
-                "Use torch_sam_v1 or torch_sam_v2."
-            )
-
         img_array = load_image(image)
 
         if output_formats is None:
             output_formats = self.config.outputs.default_formats  # type: ignore
 
-        raw_masks = self.backend.generate_all(
+        raw_masks = self._backend_method("generate_all")(
             img_array,
             points_per_side=points_per_side,
             pred_iou_thresh=pred_iou_thresh,

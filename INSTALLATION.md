@@ -1,73 +1,59 @@
 # Installation Guide
 
-## Standard Installation
+## 1. Install perceptra-seg
 
-### 1. Install Segmentor with PyTorch
 ```bash
-pip install segmentor[torch]
+pip install "perceptra-seg[torch]"          # SDK
+pip install "perceptra-seg[server,torch]"   # SDK + REST service
+pip install perceptra-seg                   # REST client only (no torch)
 ```
 
-### 2. Install SAM Models
+## 2. Install the SAM model code you need
 
-SAM models are hosted on GitHub and must be installed separately:
+The model code lives on GitHub, not PyPI (PyPI packages cannot depend on git URLs), so install it separately:
 
-**SAM v1 (Required):**
 ```bash
-pip install git+https://github.com/facebookresearch/segment-anything.git
+# sam_v1
+pip install "git+https://github.com/facebookresearch/segment-anything.git"
+
+# sam_v2
+pip install "git+https://github.com/facebookresearch/sam2.git"
+
+# sam_v3 — always the latest upstream code; requires a CUDA GPU and PyTorch >= 2.7
+pip install "perceptra-seg[sam3]" "git+https://github.com/facebookresearch/sam3.git"
 ```
 
-**SAM v2 (Optional):**
+Update SAM3 to the newest upstream commit later with:
+
 ```bash
-pip install git+https://github.com/facebookresearch/segment-anything-2.git
+pip install -U --force-reinstall --no-deps "git+https://github.com/facebookresearch/sam3.git"
 ```
 
-### 3. Verify Installation
+## 3. Model weights
+
+- **sam_v1 / sam_v2**: downloaded automatically on first use into `$PERCEPTRA_SEG_CACHE_DIR`
+  (default `~/.cache/segmentor`), or pass `checkpoint_path`.
+- **sam_v3**: gated on HuggingFace. Request access to [facebook/sam3](https://huggingface.co/facebook/sam3),
+  then `export HF_TOKEN=...` (cached in `$HF_HOME`), or pass `checkpoint_path` /
+  `SEGMENTOR_SAM3_CHECKPOINT=/path/sam3.pt`.
+
+## 4. Verify
+
 ```bash
-python -m segmentor.quickstart
+python -m perceptra_seg.quickstart
 ```
 
-## Why Separate Installation?
+## Requirements file
 
-PyPI doesn't allow packages to depend directly on Git repositories. This is a limitation of PyPI's infrastructure, not Segmentor.
-
-## Troubleshooting
-
-### Error: "ModuleNotFoundError: No module named 'segment_anything'"
-
-**Solution:**
-```bash
-pip install git+https://github.com/facebookresearch/segment-anything.git
-```
-
-### Error: "No SAM models found"
-
-**Solution:** Install at least SAM v1 (see above)
-
-## Docker Installation
-
-For Docker users, SAM models are included in the image:
-```dockerfile
-FROM python:3.10
-
-RUN pip install segmentor[torch]
-RUN pip install git+https://github.com/facebookresearch/segment-anything.git
-
-# Your app code here
-```
-
-## Requirements File
-
-For reproducible environments, create `requirements.txt`:
 ```txt
-# Core package
-segmentor[torch]>=0.1.0
-
-# SAM models (not on PyPI)
+perceptra-seg[torch,sam3]>=0.3.0
 segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
-sam2 @ git+https://github.com/facebookresearch/segment-anything-2.git
+SAM-2 @ git+https://github.com/facebookresearch/sam2.git
+sam3 @ git+https://github.com/facebookresearch/sam3.git
 ```
 
-Install with:
-```bash
-pip install -r requirements.txt
-```
+Replace the branch with `@<commit-sha>` on each git URL for reproducible environments.
+
+## Docker
+
+See "Deploying the service" in the README: `cp .env.example .env && docker compose up -d --build`.

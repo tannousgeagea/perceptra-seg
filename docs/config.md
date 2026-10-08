@@ -330,19 +330,15 @@ pytest tests/ -v
 ### Running with Docker
 
 ```bash
-# Build CPU image
-docker build -t segmentor:cpu -f Dockerfile .
+# Recommended: docker compose (see README "Deploying the service")
+cp .env.example .env && docker compose up -d --build
 
-# Build GPU image
-docker build -t segmentor:gpu -f Dockerfile.gpu .
-
-# Run CPU
-docker run -p 8080:8080 segmentor:cpu
-
-# Run GPU
+# Or plain docker
+docker build -t perceptra-seg .
 docker run --gpus all -p 8080:8080 \
-  -v ~/.cache/segmentor:/home/segmentor/.cache/segmentor \
-  segmentor:gpu
+  -e SEGMENTOR_MODEL_NAMES=sam_v3 -e HF_TOKEN=$HF_TOKEN \
+  -v perceptra-models:/models \
+  perceptra-seg
 
 # With custom config
 docker run -p 8080:8080 \

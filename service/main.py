@@ -1,17 +1,44 @@
 """FastAPI application factory."""
 
+import json
 import logging
 import os
+import threading
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
 
+from perceptra_seg.__version__ import __version__
 from perceptra_seg.config import SegmentorConfig
+from perceptra_seg.exceptions import (
+    ImageLoadError,
+    InvalidPromptError,
+    SegmentorError,
+    UnsupportedOperationError,
+)
 from service.middleware import LoggingMiddleware
-from service.routes import router
+from service.routes import LoadedModel, router
 
 logger = logging.getLogger(__name__)
+
+
+# Written by the Dockerfile: the upstream sam3 commit the image was built from.
+_BUILD_INFO_PATH = Path(__file__).resolve().parent.parent / "build-info.json"
+
+
+def _build_info() -> dict[str, Any]:
+    info: dict[str, Any] = {"perceptra_seg": __version__}
+    try:
+        info.update(json.loads(_BUILD_INFO_PATH.read_text()))
+    except (OSError, ValueError):
+        pass
+    return info
 
 
 def _parse_model_names() -> list[str]:
@@ -26,30 +53,84 @@ def _parse_model_names() -> list[str]:
     return [single] if single else ["sam_v2"]
 
 
-def _build_config_for(model_name: str) -> SegmentorConfig:
-    """
-    Create a SegmentorConfig for one model: apply shared env overrides
-    (device, precision, api_keys, …) then pin the model name explicitly
-    so it is not overridden by SEGMENTOR_MODEL_NAME in the env.
-    """
-    cfg = SegmentorConfig()
+def load_config() -> SegmentorConfig:
+    """Base config: optional YAML file (SEGMENTOR_CONFIG) + SEGMENTOR_* env overrides."""
+    path = os.getenv("SEGMENTOR_CONFIG", "").strip()
+    cfg = SegmentorConfig.from_yaml(path) if path else SegmentorConfig()
     cfg.apply_env_overrides()
+    return cfg
+
+
+def _build_config_for(base: SegmentorConfig, model_name: str) -> SegmentorConfig:
+    """Copy of the shared config pinned to one model."""
+    cfg = base.model_copy(deep=True)
     cfg.model.name = model_name  # type: ignore[assignment]
     return cfg
 
 
-def create_app(config: SegmentorConfig | None = None) -> FastAPI:
-    """Create and configure FastAPI application."""
-    # `config` param kept for backward compat (e.g. tests); multi-model
-    # loading always uses env vars at startup.
-    base_config = config or SegmentorConfig()
+def _load_models(base: SegmentorConfig, names: list[str]) -> dict[str, LoadedModel]:
+    from perceptra_seg import Segmentor
+
+    models: dict[str, LoadedModel] = {}
+    for name in names:
+        try:
+            cfg = _build_config_for(base, name)
+            models[name] = LoadedModel(name=name, segmentor=Segmentor(config=cfg), lock=threading.Lock())
+            logger.info("Model loaded: %s (device=%s precision=%s)",
+                        name, cfg.runtime.device, cfg.runtime.precision)
+        except Exception:
+            logger.exception("Failed to load model '%s' — skipping", name)
+    return models
+
+
+def create_app(
+    config: SegmentorConfig | None = None,
+    models: dict[str, Any] | None = None,
+) -> FastAPI:
+    """Create and configure the FastAPI application.
+
+    Args:
+        config: Service config. Defaults to ``load_config()`` (YAML + env overrides).
+        models: Pre-built ``{name: Segmentor}`` mapping; skips loading at startup (tests,
+            embedding). When omitted, models listed in SEGMENTOR_MODEL_NAMES are loaded.
+    """
+    base_config = config or load_config()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        if models is not None:
+            loaded = {
+                name: LoadedModel(name=name, segmentor=seg, lock=threading.Lock())
+                for name, seg in models.items()
+            }
+            primary = next(iter(loaded), None)
+        else:
+            names = _parse_model_names()
+            logger.info("Loading models: %s", names)
+            loaded = _load_models(base_config, names)
+            primary = next((n for n in names if n in loaded), None)
+            if not loaded:
+                logger.error("No models loaded — service will return 503 on inference requests")
+
+        app.state.models = loaded
+        app.state.primary_model = primary
+        try:
+            yield
+        finally:
+            for name, entry in loaded.items():
+                try:
+                    entry.segmentor.close()
+                    logger.info("Model closed: %s", name)
+                except Exception:
+                    logger.exception("Error closing model '%s'", name)
 
     app = FastAPI(
-        title="Segmentor API",
+        title="Perceptra-Seg API",
         description="Production segmentation service with SAM models",
-        version="0.1.0",
+        version=__version__,
         docs_url="/docs",
         redoc_url="/redoc",
+        lifespan=lifespan,
     )
 
     app.add_middleware(
@@ -62,49 +143,23 @@ def create_app(config: SegmentorConfig | None = None) -> FastAPI:
     app.add_middleware(LoggingMiddleware)
 
     app.state.config = base_config
-    app.state.models: dict = {}
-    app.state.primary_model: str | None = None
-    # Legacy single-model attr — always points to the primary.
-    app.state.segmentor = None
+    app.state.build_info = _build_info()
+    app.state.models = {}
+    app.state.primary_model = None
+
+    @app.exception_handler(InvalidPromptError)
+    @app.exception_handler(UnsupportedOperationError)
+    @app.exception_handler(ImageLoadError)
+    async def _bad_request(_: Request, exc: SegmentorError) -> JSONResponse:
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @app.exception_handler(SegmentorError)
+    async def _segmentor_error(_: Request, exc: SegmentorError) -> JSONResponse:
+        logger.error("Segmentation failed: %s", exc)
+        return JSONResponse(status_code=500, content={"detail": str(exc)})
 
     app.include_router(router, prefix="/v1")
-
-    metrics_app = make_asgi_app()
-    app.mount("/metrics", metrics_app)
-
-    @app.on_event("startup")
-    async def startup_event() -> None:
-        from perceptra_seg import Segmentor
-
-        model_names = _parse_model_names()
-        logger.info("Loading models: %s", model_names)
-
-        models: dict = {}
-        for name in model_names:
-            try:
-                cfg = _build_config_for(name)
-                seg = Segmentor(config=cfg)
-                models[name] = seg
-                logger.info("Model loaded: %s (device=%s precision=%s)",
-                            name, cfg.runtime.device, cfg.runtime.precision)
-            except Exception:
-                logger.exception("Failed to load model '%s' — skipping", name)
-
-        if not models:
-            logger.error("No models loaded — service will return 503 on inference requests")
-
-        app.state.models = models
-        app.state.primary_model = model_names[0] if models else None
-        app.state.segmentor = models.get(model_names[0]) if models else None
-
-    @app.on_event("shutdown")
-    async def shutdown_event() -> None:
-        for name, seg in app.state.models.items():
-            try:
-                seg.close()
-                logger.info("Model closed: %s", name)
-            except Exception:
-                logger.exception("Error closing model '%s'", name)
+    app.mount("/metrics", make_asgi_app())
 
     return app
 

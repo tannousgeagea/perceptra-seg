@@ -1,29 +1,50 @@
 # Perceptra Seg
 
-Production-grade segmentation tool powered by Segment Anything Models (SAM v1 & v2).
+Production-grade segmentation tool powered by Segment Anything Models (SAM v1, v2 and v3).
+
+Use it three ways:
+
+- **Python SDK** (`perceptra_seg.Segmentor`): run models in-process.
+- **REST service** (`docker compose up`): a standalone segmentation server for your infrastructure.
+- **REST client** (`perceptra_seg.client.SegmentorClient`): call a deployed server from any Python app (no torch needed).
 
 ## Features
 
-- 🚀 **Easy to use**: Simple Python SDK and REST API
+- 🚀 **Easy to use**: Simple Python SDK, REST API and API client
 - 🔌 **Pluggable backends**: PyTorch and ONNX Runtime support
-- 📦 **Multiple models**: SAM v1 and SAM v2
-- 🎯 **Flexible prompts**: Bounding boxes, points, or both
+- 📦 **Multiple models**: SAM v1, SAM v2 and SAM v3 (latest upstream `facebookresearch/sam3`), several served at once
+- 🎯 **Flexible prompts**: Boxes, points, text (concepts), visual exemplars
 - 📤 **Multiple outputs**: RLE, PNG, polygons, numpy arrays
-- ⚡ **Performance**: GPU acceleration, caching, optional tiling
-- 🐳 **Ready for production**: Docker images, metrics, structured logging
+- ⚡ **Performance**: GPU acceleration, embedding reuse across prompts on the same image
+- 🐳 **Ready for production**: Docker Compose deployment, API keys, metrics, structured logging
 
 ## Installation
 
 ```bash
-# Basic installation with PyTorch backend
-pip install perceptra-seg[torch]
+# SDK with PyTorch backend
+pip install "perceptra-seg[torch]"
 
-# With FastAPI server
-pip install perceptra-seg[server,torch]
+# + FastAPI server
+pip install "perceptra-seg[server,torch]"
 
-# All features
-pip install perceptra-seg[all]
+# REST client only (talks to a deployed server; no torch required)
+pip install perceptra-seg
 ```
+
+The SAM model code is not on PyPI; install the models you need from their official repos:
+
+```bash
+pip install "git+https://github.com/facebookresearch/segment-anything.git"   # sam_v1
+pip install "git+https://github.com/facebookresearch/sam2.git"               # sam_v2
+pip install "perceptra-seg[sam3]" "git+https://github.com/facebookresearch/sam3.git"  # sam_v3 (latest)
+```
+
+SAM3 notes:
+
+- Requires a CUDA GPU (upstream has no CPU path) and PyTorch ≥ 2.7.
+- Weights are gated on HuggingFace: request access to [facebook/sam3](https://huggingface.co/facebook/sam3)
+  and set `HF_TOKEN`, or point `checkpoint_path` / `SEGMENTOR_SAM3_CHECKPOINT` at a local `sam3.pt`.
+- To pick up upstream changes later: `pip install -U --force-reinstall --no-deps "git+https://github.com/facebookresearch/sam3.git"`.
 
 ## Quick Start
 
@@ -63,55 +84,79 @@ result = segmentor.segment_from_points(
 segmentor.close()
 ```
 
+SAM3 concept prompts:
+
+```python
+seg = Segmentor(model="sam_v3", device="cuda")
+trucks = seg.segment_from_text(image, "truck")                        # every truck
+similar = seg.segment_from_exemplar_box(image, (120, 80, 300, 260))  # everything like this object
+by_label = seg.segment_from_text_batch(image, ["truck", "wheel"])    # one image encoding, many concepts
+```
+
 ### REST API
 
 Start the server:
 
 ```bash
-# Using CLI
-segmentor-cli serve --config config.yaml
-
-# Or with uvicorn
-uvicorn service.main:app --host 0.0.0.0 --port 8080
+SEGMENTOR_MODEL_NAMES=sam_v3,sam_v2 uvicorn service.main:app --host 0.0.0.0 --port 8080
 ```
 
-Make requests:
+Call it with the bundled client:
+
+```python
+from perceptra_seg.client import SegmentorClient
+
+client = SegmentorClient("http://localhost:8080", api_key="...")
+client.health()
+client.segment_box("truck.jpg", (100, 100, 400, 400), output_formats=["rle", "polygons"])
+client.segment_text("truck.jpg", "wheel", model="sam_v3")
+client.segment_points(image_array, [(250, 200, 1)], model="sam_v2")
+```
+
+Or with plain HTTP (`image` is base64 or an `http(s)://` URL; `?model=` selects a loaded model):
 
 ```bash
-# Segment from box
-curl -X POST http://localhost:8080/v1/segment/box \
-  -H "Content-Type: application/json" \
-  -d '{
-    "image": "",
-    "box": [100, 100, 400, 400],
-    "output_formats": ["rle", "png"]
-  }'
-
-# Segment from points
-curl -X POST http://localhost:8080/v1/segment/points \
-  -H "Content-Type: application/json" \
-  -d '{
-    "image": "",
-    "points": [{"x": 250, "y": 200, "label": 1}],
-    "output_formats": ["rle"]
-  }'
+curl -X POST "http://localhost:8080/v1/segment/text?model=sam_v3" \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  -d "{\"image\": \"$(base64 -w0 truck.jpg)\", \"text\": \"wheel\"}"
 ```
 
-## Docker
+Interactive API docs are served at `/docs`.
+
+## Deploying the service (Docker Compose)
+
+Requires Docker with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/).
 
 ```bash
-# Build CPU image
-docker build -t segmentor:cpu -f Dockerfile .
-
-# Build GPU image
-docker build -t segmentor:gpu -f Dockerfile.gpu .
-
-# Run
-docker run -p 8080:8080 segmentor:cpu
-
-# With GPU
-docker run --gpus all -p 8080:8080 segmentor:gpu
+cp .env.example .env      # set HF_TOKEN, SEG_API_KEYS, SEG_MODELS, ...
+docker compose up -d --build
+curl http://localhost:29086/v1/healthz
 ```
+
+- **Latest SAM3**: the image installs `facebookresearch/sam3` from git at build time (`SAM3_REF`, default `main`).
+  Every `docker compose build` checks upstream and rebuilds that layer when a new commit exists.
+  For reproducible production deploys, pin a commit: `SAM3_REF=<sha> docker compose build`.
+  `/v1/healthz` reports the deployed commit under `build.sam3_commit`.
+- **Weights** are not baked into the image. They download on first start into the `models` volume and
+  persist across restarts and rebuilds. To warm the cache before a deploy:
+  `docker compose run --rm perceptra-seg python scripts/download_sam3.py`.
+- **Auth**: set `SEG_API_KEYS=key1,key2`; clients send `Authorization: Bearer <key>`. `/v1/healthz` and `/metrics` stay public.
+- **Models**: `SEG_MODELS=sam_v3,sam_v2` loads both; the first is the default. Requests to one model are
+  processed one at a time (models keep per-image state); different models run concurrently.
+- **Limits**: `SEGMENTOR_SERVER_MAX_IMAGE_SIZE_MB` / `SEGMENTOR_SERVER_MAX_IMAGE_DIMENSION` (413 when exceeded).
+- Any config value can be overridden with `SEGMENTOR_<SECTION>_<FIELD>`, or mount a YAML file and set `SEGMENTOR_CONFIG=/path/config.yaml`.
+
+| Endpoint | Models | Purpose |
+|---|---|---|
+| `POST /v1/segment/box` | all | One mask from a box |
+| `POST /v1/segment/points` | all | One mask from positive/negative points |
+| `POST /v1/segment` | all | Several boxes and/or points (`strategy`: largest, merge, all) |
+| `POST /v1/segment/text` | sam_v3 | All instances of a text concept (optional `box` exemplar) |
+| `POST /v1/segment/text/batch` | sam_v3 | Several concepts, one image encoding |
+| `POST /v1/segment/exemplar` | sam_v3 | All objects similar to an exemplar box |
+| `POST /v1/segment/auto` | sam_v1, sam_v2 | Everything in the image, no prompt |
+| `GET /v1/healthz` | | Status, loaded models, build info |
+| `GET /metrics` | | Prometheus metrics |
 
 ## Configuration
 
@@ -421,7 +466,8 @@ Test coverage includes:
 ### Import errors
 - Ensure correct extras installed: `pip install perceptra-seg[torch]`
 - For SAM v1: `pip install git+https://github.com/facebookresearch/segment-anything.git`
-- For SAM v2: `pip install git+https://github.com/facebookresearch/segment-anything-2.git`
+- For SAM v2: `pip install git+https://github.com/facebookresearch/sam2.git`
+- For SAM v3: `pip install "perceptra-seg[sam3]" git+https://github.com/facebookresearch/sam3.git`
 
 ### Model download fails
 - Check internet connection
@@ -497,7 +543,7 @@ perceptra-seg/
 ├── README.md
 ├── config.yaml
 ├── Dockerfile
-├── Dockerfile.gpu
+├── docker-compose.yml
 ├── .pre-commit-config.yaml
 ├── .github/
 │   └── workflows/

@@ -49,7 +49,7 @@ def mask_to_polygons(
     # 1. Smooth mask edges with a Gaussian blur before contour extraction.
     #    This converts the pixel-level staircase boundary into a smooth gradient
     #    that, after re-thresholding, yields a rounded mask edge.
-    blurred = cv2.GaussianBlur(mask.astype(np.float32), (5, 5), sigma=1.5)
+    blurred = cv2.GaussianBlur(mask.astype(np.float32), (5, 5), 1.5)
     smooth_mask = (blurred > 0.5).astype(np.uint8)
 
     # 2. Extract contours with all points (CHAIN_APPROX_NONE) so Shapely has

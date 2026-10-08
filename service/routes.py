@@ -1,18 +1,43 @@
 """API route handlers."""
 
 import base64
+import binascii
+import io
 import logging
-import time
+import secrets
+import threading
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from PIL import Image
 from pydantic import BaseModel, Field
-
-from perceptra_seg.exceptions import InvalidPromptError, SegmentorError
+from starlette.concurrency import run_in_threadpool
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+@dataclass
+class LoadedModel:
+    """A loaded Segmentor plus the lock serialising access to it.
+
+    Backends keep per-image state (cached embeddings, prompt state), so a model must
+    only serve one request at a time. Inference runs in a worker thread so the event
+    loop keeps serving health checks and other models meanwhile.
+    """
+
+    name: str
+    segmentor: Any
+    lock: threading.Lock
+
+    async def run(self, method: str, **kwargs: Any) -> Any:
+        def _call() -> Any:
+            with self.lock:
+                return getattr(self.segmentor, method)(**kwargs)
+
+        return await run_in_threadpool(_call)
 
 
 # Request models
@@ -37,7 +62,7 @@ class SegmentPointsRequest(BaseModel):
     """Request for point-based segmentation."""
 
     image: str
-    points: list[PointPrompt]
+    points: list[PointPrompt] = Field(..., min_length=1)
     output_formats: list[str] = Field(default=["rle"])
 
 
@@ -51,86 +76,26 @@ class SegmentRequest(BaseModel):
     output_formats: list[str] = Field(default=["rle"])
 
 
-# Response models
-class SegmentationResponse(BaseModel):
-    """Segmentation response."""
-
-    rle: dict[str, Any] | None = None
-    png_base64: str | None = None
-    polygons: list[list[list[float]]] | None = None
-    score: float
-    area: int
-    bbox: list[int] | None = None
-    latency_ms: float
-    model_info: dict[str, Any]
-    request_id: str
-
-
-# Dependency functions
-async def get_segmentor(
-    request: Request,
-    model: str | None = Query(
-        None,
-        description="Model to use (e.g. 'sam_v2', 'sam_v3'). Omit to use the primary model.",
-    ),
-) -> Any:
-    """Resolve and return the requested Segmentor instance."""
-    models: dict = getattr(request.app.state, "models", {})
-    if not models:
-        raise HTTPException(status_code=503, detail="No models loaded")
-
-    model_name = model or getattr(request.app.state, "primary_model", None)
-    segmentor = models.get(model_name)
-    if segmentor is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Model '{model_name}' is not loaded. Available: {sorted(models.keys())}",
-        )
-    return segmentor
-
-
-async def verify_api_key(request: Request) -> None:
-    """Verify API key if configured."""
-    config = request.app.state.config
-    if not config.server.api_keys:
-        return  # No auth required
-
-    auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid authorization header",
-        )
-
-    token = auth_header[7:]  # Remove "Bearer "
-    if token not in config.server.api_keys:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid API key",
-        )
-
-
-def decode_image(image_str: str) -> bytes:
-    """Decode base64 image or fetch from URL."""
-    if image_str.startswith(("http://", "https://")):
-        # Return URL string to be handled by load_image
-        return image_str  # type: ignore
-
-    # Decode base64
-    try:
-        # Remove data URL prefix if present
-        if "base64," in image_str:
-            image_str = image_str.split("base64,")[1]
-        return base64.b64decode(image_str)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid base64 image: {e}")
-
-
 class SegmentTextRequest(BaseModel):
     """Request for text-prompt segmentation (SAM3 only)."""
 
     image: str = Field(..., description="Base64-encoded image or URL")
     text: str = Field(..., min_length=1, max_length=500, description="Natural language prompt")
+    box: list[int] | None = Field(
+        default=None,
+        min_length=4,
+        max_length=4,
+        description="Optional [x1, y1, x2, y2] positive exemplar refining the text prompt",
+    )
+    output_formats: list[str] = Field(default=["rle", "polygons"])
+
+
+class SegmentTextBatchRequest(BaseModel):
+    """Several text prompts against one image, sharing a single encoding (SAM3 only)."""
+
+    image: str = Field(..., description="Base64-encoded image or URL")
+    texts: list[str] = Field(..., min_length=1, max_length=50)
+    min_score: float = Field(default=0.0, ge=0.0, le=1.0)
     output_formats: list[str] = Field(default=["rle", "polygons"])
 
 
@@ -152,12 +117,98 @@ class SegmentAutoRequest(BaseModel):
     output_formats: list[str] = Field(default=["rle", "polygons"])
 
 
+# Response models
+class SegmentationResponse(BaseModel):
+    """Segmentation response."""
+
+    rle: dict[str, Any] | None = None
+    png_base64: str | None = None
+    polygons: list[list[list[float]]] | None = None
+    score: float
+    area: int
+    bbox: list[int] | None = None
+    latency_ms: float
+    model_info: dict[str, Any]
+    request_id: str
+
+
+# Dependency functions
+async def verify_api_key(request: Request) -> None:
+    """Verify the bearer token if API keys are configured."""
+    config = request.app.state.config
+    if not config.server.api_keys:
+        return  # No auth required
+
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid authorization header",
+        )
+
+    token = auth_header[7:].encode()
+    if not any(secrets.compare_digest(token, key.encode()) for key in config.server.api_keys):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API key",
+        )
+
+
+async def get_model(
+    request: Request,
+    model: str | None = Query(
+        None,
+        description="Model to use (e.g. 'sam_v2', 'sam_v3'). Omit to use the primary model.",
+    ),
+) -> LoadedModel:
+    """Resolve the requested model."""
+    models: dict[str, LoadedModel] = request.app.state.models
+    if not models:
+        raise HTTPException(status_code=503, detail="No models loaded")
+
+    model_name = model or request.app.state.primary_model
+    entry = models.get(model_name)
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model '{model_name}' is not loaded. Available: {sorted(models.keys())}",
+        )
+    return entry
+
+
+def decode_image(image_str: str, request: Request) -> bytes | str:
+    """Decode a base64 image (enforcing size limits) or pass a URL through."""
+    if image_str.startswith(("http://", "https://")):
+        return image_str  # fetched by load_image
+
+    server = request.app.state.config.server
+    if "base64," in image_str:
+        image_str = image_str.split("base64,", 1)[1]
+    if len(image_str) * 3 / 4 > server.max_image_size_mb * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"Image exceeds {server.max_image_size_mb} MB")
+    try:
+        data = base64.b64decode(image_str, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 image: {e}")
+
+    try:
+        width, height = Image.open(io.BytesIO(data)).size  # header only, no full decode
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Unreadable image: {e}")
+    if max(width, height) > server.max_image_dimension:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Image {width}x{height} exceeds max dimension {server.max_image_dimension}",
+        )
+    return data
+
+
 # Routes
 @router.get("/healthz")
 async def health_check(request: Request) -> dict[str, Any]:
     """Health check endpoint — reports all loaded models."""
-    models: dict = getattr(request.app.state, "models", {})
-    primary: str | None = getattr(request.app.state, "primary_model", None)
+    models: dict[str, LoadedModel] = request.app.state.models
+    primary: str | None = request.app.state.primary_model
 
     try:
         import torch
@@ -168,19 +219,20 @@ async def health_check(request: Request) -> dict[str, Any]:
     models_info = {
         name: {
             "loaded": True,
-            "device": seg.config.runtime.device,
-            "precision": seg.config.runtime.precision,
+            "device": entry.segmentor.config.runtime.device,
+            "precision": entry.segmentor.config.runtime.precision,
         }
-        for name, seg in models.items()
+        for name, entry in models.items()
     }
 
     # Backward-compat flat fields for the primary model
-    primary_seg = models.get(primary) if primary else None
+    primary_seg = models[primary].segmentor if primary in models else None
     return {
         "status": "ok" if models else "degraded",
         "primary_model": primary,
         "models": models_info,
         "gpu_memory_used_mb": gpu_total_mb,
+        "build": request.app.state.build_info,
         # legacy fields
         "model_loaded": bool(models),
         "model_name": primary,
@@ -191,167 +243,130 @@ async def health_check(request: Request) -> dict[str, Any]:
 
 @router.post("/segment/box", response_model=SegmentationResponse)
 async def segment_box(
-    request: SegmentBoxRequest,
-    segmentor: Any = Depends(get_segmentor),
+    body: SegmentBoxRequest,
+    request: Request,
     _auth: None = Depends(verify_api_key),
+    model: LoadedModel = Depends(get_model),
 ) -> dict[str, Any]:
     """Segment object from bounding box."""
-    try:
-        start_time = time.time()
-
-        # Decode image
-        image_data = decode_image(request.image)
-
-        # Segment
-        result = segmentor.segment_from_box(
-            image=image_data,
-            box=tuple(request.box),
-            output_formats=request.output_formats,
-        )
-
-        return result.to_dict()
-
-    except InvalidPromptError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except SegmentorError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        logger.exception("Unexpected error in segment_box")
-        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
+    result = await model.run(
+        "segment_from_box",
+        image=decode_image(body.image, request),
+        box=tuple(body.box),
+        output_formats=body.output_formats,
+    )
+    return result.to_dict()
 
 
 @router.post("/segment/points", response_model=SegmentationResponse)
 async def segment_points(
-    request: SegmentPointsRequest,
-    segmentor: Any = Depends(get_segmentor),
+    body: SegmentPointsRequest,
+    request: Request,
     _auth: None = Depends(verify_api_key),
+    model: LoadedModel = Depends(get_model),
 ) -> dict[str, Any]:
     """Segment object from point prompts."""
-    try:
-        image_data = decode_image(request.image)
-
-        # Convert points
-        points = [(p.x, p.y, p.label) for p in request.points]
-
-        result = segmentor.segment_from_points(
-            image=image_data,
-            points=points,
-            output_formats=request.output_formats,
-        )
-
-        return result.to_dict()
-
-    except InvalidPromptError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except SegmentorError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        logger.exception("Unexpected error in segment_points")
-        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
+    result = await model.run(
+        "segment_from_points",
+        image=decode_image(body.image, request),
+        points=[(p.x, p.y, p.label) for p in body.points],
+        output_formats=body.output_formats,
+    )
+    return result.to_dict()
 
 
 @router.post("/segment/text", response_model=list[SegmentationResponse])
 async def segment_text(
-    request: SegmentTextRequest,
-    segmentor: Any = Depends(get_segmentor),
+    body: SegmentTextRequest,
+    request: Request,
     _auth: None = Depends(verify_api_key),
+    model: LoadedModel = Depends(get_model),
 ) -> list[dict[str, Any]]:
-    """Segment objects matching a text prompt (SAM3 only)."""
-    try:
-        image_data = decode_image(request.image)
-        results = segmentor.segment_from_text(
-            image=image_data,
-            text=request.text,
-            output_formats=request.output_formats,
+    """Segment all objects matching a text prompt, optionally refined by an exemplar box (SAM3 only)."""
+    image = decode_image(body.image, request)
+    if body.box is not None:
+        results = await model.run(
+            "segment_from_text_and_box",
+            image=image,
+            text=body.text,
+            box=tuple(body.box),
+            output_formats=body.output_formats,
         )
-        return [r.to_dict() for r in results]
-    except InvalidPromptError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except SegmentorError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        logger.exception("Unexpected error in segment_text")
-        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
+    else:
+        results = await model.run(
+            "segment_from_text", image=image, text=body.text, output_formats=body.output_formats
+        )
+    return [r.to_dict() for r in results]
+
+
+@router.post("/segment/text/batch", response_model=dict[str, list[SegmentationResponse]])
+async def segment_text_batch(
+    body: SegmentTextBatchRequest,
+    request: Request,
+    _auth: None = Depends(verify_api_key),
+    model: LoadedModel = Depends(get_model),
+) -> dict[str, list[dict[str, Any]]]:
+    """Segment several concepts in one image with a shared encoding (SAM3 only)."""
+    results = await model.run(
+        "segment_from_text_batch",
+        image=decode_image(body.image, request),
+        text_prompts=body.texts,
+        min_score=body.min_score,
+        output_formats=body.output_formats,
+    )
+    return {text: [r.to_dict() for r in items] for text, items in results.items()}
 
 
 @router.post("/segment/exemplar", response_model=list[SegmentationResponse])
 async def segment_exemplar(
-    request: SegmentExemplarRequest,
-    segmentor: Any = Depends(get_segmentor),
+    body: SegmentExemplarRequest,
+    request: Request,
     _auth: None = Depends(verify_api_key),
+    model: LoadedModel = Depends(get_model),
 ) -> list[dict[str, Any]]:
     """Find all objects visually similar to the exemplar box (SAM3 only)."""
-    try:
-        image_data = decode_image(request.image)
-        results = segmentor.segment_from_exemplar_box(
-            image=image_data,
-            box=tuple(request.exemplar_box),
-            output_formats=request.output_formats,
-        )
-        return [r.to_dict() for r in results]
-    except InvalidPromptError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except SegmentorError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        logger.exception("Unexpected error in segment_exemplar")
-        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
+    results = await model.run(
+        "segment_from_exemplar_box",
+        image=decode_image(body.image, request),
+        box=tuple(body.exemplar_box),
+        output_formats=body.output_formats,
+    )
+    return [r.to_dict() for r in results]
 
 
 @router.post("/segment/auto", response_model=list[SegmentationResponse])
 async def segment_auto(
-    request: SegmentAutoRequest,
-    segmentor: Any = Depends(get_segmentor),
+    body: SegmentAutoRequest,
+    request: Request,
     _auth: None = Depends(verify_api_key),
+    model: LoadedModel = Depends(get_model),
 ) -> list[dict[str, Any]]:
     """Auto-segment entire image with no prompts (SAM v1/v2 only)."""
-    try:
-        image_data = decode_image(request.image)
-        results = segmentor.segment_auto(
-            image=image_data,
-            points_per_side=request.points_per_side,
-            pred_iou_thresh=request.pred_iou_thresh,
-            stability_score_thresh=request.stability_score_thresh,
-            output_formats=request.output_formats,
-        )
-        return [r.to_dict() for r in results]
-    except InvalidPromptError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except SegmentorError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        logger.exception("Unexpected error in segment_auto")
-        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
+    results = await model.run(
+        "segment_auto",
+        image=decode_image(body.image, request),
+        points_per_side=body.points_per_side,
+        pred_iou_thresh=body.pred_iou_thresh,
+        stability_score_thresh=body.stability_score_thresh,
+        output_formats=body.output_formats,
+    )
+    return [r.to_dict() for r in results]
 
 
 @router.post("/segment", response_model=list[SegmentationResponse])
 async def segment(
-    request: SegmentRequest,
-    segmentor: Any = Depends(get_segmentor),
+    body: SegmentRequest,
+    request: Request,
     _auth: None = Depends(verify_api_key),
+    model: LoadedModel = Depends(get_model),
 ) -> list[dict[str, Any]]:
     """General segmentation endpoint supporting boxes and/or points."""
-    try:
-        image_data = decode_image(request.image)
-
-        # Convert inputs
-        boxes = [tuple(box) for box in request.boxes] if request.boxes else None
-        points = [(p.x, p.y, p.label) for p in request.points] if request.points else None
-
-        results = segmentor.segment(
-            image=image_data,
-            boxes=boxes,
-            points=points,
-            strategy=request.strategy,
-            output_formats=request.output_formats,
-        )
-
-        return [r.to_dict() for r in results]
-
-    except InvalidPromptError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except SegmentorError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        logger.exception("Unexpected error in segment")
-        raise HTTPException(status_code=500, detail=f"Internal error: {e}")
+    results = await model.run(
+        "segment",
+        image=decode_image(body.image, request),
+        boxes=[tuple(box) for box in body.boxes] if body.boxes else None,
+        points=[(p.x, p.y, p.label) for p in body.points] if body.points else None,
+        strategy=body.strategy,
+        output_formats=body.output_formats,
+    )
+    return [r.to_dict() for r in results]

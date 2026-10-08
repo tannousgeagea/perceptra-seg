@@ -49,6 +49,7 @@ def serve_command(args: argparse.Namespace) -> None:
     from service.main import create_app
 
     config = SegmentorConfig.from_yaml(args.config) if args.config else SegmentorConfig()
+    config.apply_env_overrides()
 
     app = create_app(config)
 

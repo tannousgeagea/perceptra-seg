@@ -1,10 +1,21 @@
-"""PyTorch backend for SAM v3 (Official Processor Pattern)."""
+"""PyTorch backend for SAM v3, backed by the upstream ``sam3`` package.
 
-import logging
-from pathlib import Path
-from typing import Any, List, Optional, Tuple, Union
-import os
+Install the model code from the official repository (always tracks latest):
+
+    pip install "git+https://github.com/facebookresearch/sam3.git"
+
+Checkpoints are gated on HuggingFace (``facebook/sam3``); either provide a
+local checkpoint or set ``HF_TOKEN`` so the weights can be downloaded.
+"""
+
+import contextlib
 import hashlib
+import logging
+import os
+from collections.abc import Iterator
+from importlib import resources
+from typing import Any
+
 import numpy as np
 import torch
 from PIL import Image
@@ -14,416 +25,298 @@ from perceptra_seg.exceptions import BackendError, ModelLoadError
 
 logger = logging.getLogger(__name__)
 
-class TorchSAMv3Backend:
+# Legacy location used by older images that baked the checkpoint in at build time.
+_LEGACY_CHECKPOINT = "/opt/models/sam3.pt"
+
+
+def _to_numpy(x: Any) -> np.ndarray:
+    if isinstance(x, torch.Tensor):
+        return x.detach().float().cpu().numpy()
+    return np.asarray(x)
+
+
+def _split_masks(masks: Any, scores: Any) -> tuple[list[np.ndarray], list[float]]:
+    """Flatten predictor/processor output into per-object (HxW uint8 mask, score) pairs.
+
+    Handles the shapes produced by upstream sam3: ``(H, W)``, ``(N, H, W)`` and
+    ``(N, 1, H, W)`` masks with matching ``()``, ``(N,)`` or ``(N, 1)`` scores.
     """
-    Official PyTorch implementation for SAM v3 using the Processor/State pattern.
-    Matches API structure: build_sam3_image_model -> Sam3Processor -> set_image -> inference_state
+    masks_np = _to_numpy(masks)
+    scores_np = _to_numpy(scores).reshape(-1)
+    if masks_np.ndim == 2:
+        masks_np = masks_np[None]
+    if masks_np.ndim == 4:
+        masks_np = masks_np[:, 0]
+    return (
+        [(m > 0).astype(np.uint8) for m in masks_np],
+        [float(s) for s in scores_np[: len(masks_np)]],
+    )
+
+
+def _xyxy_to_norm_cxcywh(box: tuple[int, int, int, int], w: int, h: int) -> list[float]:
+    """Pixel xyxy box -> normalized [cx, cy, w, h] as expected by Sam3Processor."""
+    x1, y1, x2, y2 = box
+    return [(x1 + x2) / 2 / w, (y1 + y2) / 2 / h, (x2 - x1) / w, (y2 - y1) / h]
+
+
+class TorchSAMv3Backend:
+    """SAM v3 backend using the official ``build_sam3_image_model`` + ``Sam3Processor`` API.
+
+    Supports geometric prompts (box / points, via the SAM1-style interactive head) and
+    concept prompts (text, visual exemplars, text + exemplar).
     """
 
     def __init__(self, config: SegmentorConfig) -> None:
         self.config = config
         self.model: Any = None
         self.processor: Any = None
-        self.inference_state: Any = None  # Holds the embeddings/metadata for the current image
+        self.inference_state: dict[str, Any] | None = None
         self.device: torch.device | None = None
         self._cached_image_hash: str | None = None
 
+    # --- Lifecycle ---
+
     def load(self) -> None:
-        """Load SAM v3 model and processor."""
+        """Build the SAM3 image model and processor."""
         try:
-            import perceptra_seg.vendor.sam3 as sam3
-            from perceptra_seg.vendor.sam3.model_builder import build_sam3_image_model
-            from perceptra_seg.vendor.sam3.model.sam3_image_processor import Sam3Processor
+            from sam3.model.sam3_image_processor import Sam3Processor
+            from sam3.model_builder import build_sam3_image_model
+        except ImportError as e:
+            raise ModelLoadError(
+                "SAM3 package not found. Install it with:\n"
+                '  pip install "git+https://github.com/facebookresearch/sam3.git"'
+            ) from e
 
-            sam3_root = os.path.join(os.path.dirname(sam3.__file__), "..")
-            device_str = self.config.runtime.device
-            self.device = torch.device(device_str if torch.cuda.is_available() else "cpu")
-
-            bpe_path = os.path.join(sam3_root, "assets", "bpe_simple_vocab_16e6.txt.gz")
+        try:
+            self.device = self._resolve_device()
             checkpoint_path = self._resolve_checkpoint()
-            load_from_hf = checkpoint_path is None
-
+            if self.config.runtime.precision != "bf16":
+                logger.info("SAM3 always runs under bf16 autocast (runtime.precision=%s ignored)",
+                            self.config.runtime.precision)
             logger.info(
-                "Building SAM3 model — checkpoint: %s",
+                "Building SAM3 model on %s — checkpoint: %s",
+                self.device,
                 checkpoint_path or "HuggingFace (facebook/sam3)",
             )
+            if self.device.type == "cuda":
+                # Upstream allocates some buffers on the bare "cuda" device; make that
+                # resolve to the configured GPU (e.g. cuda:1).
+                torch.cuda.set_device(self.device)
             self.model = build_sam3_image_model(
-                bpe_path=bpe_path,
+                bpe_path=self._bpe_path(),
+                device=self.device.type,
                 checkpoint_path=checkpoint_path,
-                load_from_HF=load_from_hf,
+                load_from_HF=checkpoint_path is None,
                 enable_inst_interactivity=True,
+            ).to(self.device)
+            self.processor = Sam3Processor(
+                self.model,
+                device=str(self.device),
+                confidence_threshold=self.config.thresholds.concept_confidence_threshold,
             )
-
-            self.processor = Sam3Processor(self.model)
-            logger.info("SAM3 Processor initialized.")
-
-        except ImportError:
-            raise ModelLoadError(
-                "SAM3 package not found. Ensure the sam3 extras are installed."
-            )
+            logger.info("SAM3 processor initialized")
         except Exception as e:
             raise ModelLoadError(f"Failed to load SAM v3: {e}") from e
 
-    def _resolve_checkpoint(self) -> Optional[str]:
-        """Return a local checkpoint path, or None to trigger HF download.
+    def _resolve_device(self) -> torch.device:
+        # Upstream sam3 hard-codes CUDA in several places (position-encoding and decoder
+        # caches), so there is no CPU fallback.
+        requested = torch.device(self.config.runtime.device)
+        if requested.type != "cuda" or not torch.cuda.is_available():
+            raise ModelLoadError(
+                f"SAM3 requires a CUDA GPU (runtime.device={self.config.runtime.device!r}, "
+                f"cuda available={torch.cuda.is_available()})"
+            )
+        return requested
+
+    @staticmethod
+    def _bpe_path() -> str:
+        # Resolved explicitly: upstream's fallback relies on pkg_resources, which
+        # recent setuptools releases no longer ship.
+        return str(resources.files("sam3") / "assets" / "bpe_simple_vocab_16e6.txt.gz")
+
+    def _resolve_checkpoint(self) -> str | None:
+        """Return a local checkpoint path, or None to download from HuggingFace.
 
         Resolution order:
           1. config.model.checkpoint_path (explicit override)
           2. SEGMENTOR_SAM3_CHECKPOINT env var
-          3. /opt/models/sam3.pt  (baked in at Docker build time via scripts/download_sam3.py)
-        If none of the above exists, returns None → build_sam3_image_model downloads from HF.
+          3. /opt/models/sam3.pt (legacy images that baked the checkpoint in)
         """
-        candidates = [
-            self.config.model.checkpoint_path,
-            os.environ.get("SEGMENTOR_SAM3_CHECKPOINT"),
-            "/opt/models/sam3.pt",
-        ]
-        for path in candidates:
-            if path and os.path.isfile(path):
-                return path
+        explicit = self.config.model.checkpoint_path or os.environ.get("SEGMENTOR_SAM3_CHECKPOINT")
+        if explicit:
+            if not os.path.isfile(explicit):
+                raise ModelLoadError(f"SAM3 checkpoint not found: {explicit}")
+            return explicit
+        if os.path.isfile(_LEGACY_CHECKPOINT):
+            return _LEGACY_CHECKPOINT
         return None
 
-    # --- Image State Management ---
+    @contextlib.contextmanager
+    def _autocast(self) -> Iterator[None]:
+        # Upstream sam3 is written for bf16 autocast (all official examples enable it) and
+        # casts some activations to bf16 internally, so it cannot run in plain fp32/fp16.
+        assert self.device is not None
+        with torch.autocast(self.device.type, dtype=torch.bfloat16):
+            yield
 
-    def _compute_image_hash(self, image: np.ndarray) -> str:
-        """Compute hash for image caching."""
-        return hashlib.md5(image.tobytes()).hexdigest()
+    # --- Image state ---
 
-    def _update_state(self, image: Union[np.ndarray, Image.Image]) -> None:
-        """
-        Updates the inference state for a new image.
-        API: inference_state = processor.set_image(image)
-        """
+    def _update_state(self, image: np.ndarray) -> None:
+        """Encode the image (skipped if it is the same as the last one) and clear prompts."""
+        img_hash = hashlib.md5(image.tobytes()).hexdigest()
         try:
-            # Convert numpy array to PIL as the official example uses PIL
-            if isinstance(image, np.ndarray):
-                pil_image = Image.fromarray(image)
-                img_hash = self._compute_image_hash(image)
-            else:
-                pil_image = image
-                img_hash = self._compute_image_hash(np.array(image))
-
-            # Skip if same image
-            if img_hash == self._cached_image_hash and self.inference_state is not None:
-                self.processor.reset_all_prompts(self.inference_state)
-                return
-
-            # The processor returns a state object containing embeddings
-            self.inference_state = self.processor.set_image(pil_image)
+            if img_hash != self._cached_image_hash or self.inference_state is None:
+                with self._autocast():
+                    self.inference_state = self.processor.set_image(Image.fromarray(image))
+                self._cached_image_hash = img_hash
             self.processor.reset_all_prompts(self.inference_state)
-            self._cached_image_hash = img_hash
-
         except Exception as e:
-            raise BackendError(f"Failed to set image in SAM 3 processor: {e}") from e
+            self._cached_image_hash = None
+            raise BackendError(f"Failed to set image in SAM3 processor: {e}") from e
 
-    # --- Geometric Prompts (Inferred from processor pattern) ---
+    def _concept_outputs(self) -> tuple[list[np.ndarray], list[float]]:
+        assert self.inference_state is not None
+        return _split_masks(self.inference_state["masks"], self.inference_state["scores"])
+
+    # --- Geometric prompts (SAM1-style interactive head) ---
+
+    def _predict_inst(self, **kwargs: Any) -> tuple[list[np.ndarray], list[float]]:
+        with self._autocast():
+            masks, scores, _ = self.model.predict_inst(
+                self.inference_state, multimask_output=False, **kwargs
+            )
+        return _split_masks(masks, scores)
+
     def infer_from_box(
         self, image: np.ndarray, box: tuple[int, int, int, int]
     ) -> tuple[np.ndarray, float]:
-        """Generate mask from bounding box."""
         try:
             self._update_state(image)
-            box_np = np.array(box)
-
-            masks, scores, _ = self.model.predict_inst(
-                self.inference_state,
-                point_coords=None,
-                point_labels=None,
-                box=box_np[None, :],
-                multimask_output=False,
-            )
-
-            mask = masks[0].astype(np.uint8)
-            score = float(scores[0])
-
-            return mask, score
-
+            masks, scores = self._predict_inst(box=np.array(box)[None, :])
+            return masks[0], scores[0]
+        except BackendError:
+            raise
         except Exception as e:
-            raise BackendError(f"SAM v3 inference failed: {e}") from e
+            raise BackendError(f"SAM v3 box inference failed: {e}") from e
 
     def infer_from_points(
         self, image: np.ndarray, points: list[tuple[int, int, int]]
     ) -> tuple[np.ndarray, float]:
-        """
-        Geometric: Point Prompt.
-        Assumes processor.set_point_prompt(state=..., points=..., labels=...) exists.
-        """
         try:
             self._update_state(image)
-
-            # Separate coords and labels
-            coords = np.array([[p[0], p[1]] for p in points])
-            labels = np.array([p[2] for p in points])
-
-            masks, scores, _ = self.model.predict_inst(
-                self.inference_state,
-                point_coords=coords,
-                point_labels=labels,
-                multimask_output=False,
+            masks, scores = self._predict_inst(
+                point_coords=np.array([[x, y] for x, y, _ in points]),
+                point_labels=np.array([label for _, _, label in points]),
             )
-
-            mask = masks[0].astype(np.uint8)
-            score = float(scores[0])
-
-            return mask, score
-
+            return masks[0], scores[0]
+        except BackendError:
+            raise
         except Exception as e:
-            raise BackendError(f"SAM v3 inference failed: {e}") from e
-
-    # --- Semantic Prompts (Explicit in Snippet) ---
-
-    def infer_from_text(
-        self,
-        image: np.ndarray,
-        text: Union[str, List[str]],
-    ) -> tuple[list[np.ndarray], list[float]]:
-        """
-        Semantic: pure text prompt (Concept Segmentation).
-        """
-        self._update_state(image)
-
-        output = self.processor.set_text_prompt(
-            state=self.inference_state,
-            prompt=text,
-        )
-
-        masks = output["masks"]
-        scores = output["scores"]
-
-        mask_list, score_list = [], []
-
-        for m, s in zip(masks, scores):
-            if hasattr(m, "cpu"): m = m.cpu().squeeze(0).numpy()
-            if hasattr(s, "cpu"): s = float(s.cpu())
-
-            mask_list.append(m.astype(np.uint8))
-            score_list.append(float(s))
-
-        return mask_list, score_list
-    
-    def infer_from_text_batch(
-        self,
-        image: np.ndarray,
-        text_prompts: List[str],
-    ) -> tuple[dict[str, list[np.ndarray]], dict[str, list[float]]]:
-        """Efficient multi-text prompt inference with shared image encoding.
-        
-        Args:
-            image: RGB image
-            text_prompts: List of text queries ["fruit", "leaf", "pipe"]
-            
-        Returns:
-            Tuple of (masks_dict, scores_dict) where keys are text prompts
-            
-        Example:
-            >>> masks, scores = backend.infer_from_text_batch(img, ["apple", "leaf"])
-            >>> # masks = {"apple": [mask1, mask2], "leaf": [mask3]}
-        """
-        try:
-            # Set image once - shared encoding for all prompts
-            self._update_state(image)
-            
-            masks_dict = {}
-            scores_dict = {}
-            
-            for text in text_prompts:
-                # Reset prompts between queries to avoid interference
-                self.processor.reset_all_prompts(self.inference_state)
-                
-                output = self.processor.set_text_prompt(
-                    state=self.inference_state,
-                    prompt=text,
-                )
-                
-                masks = output["masks"]
-                scores = output["scores"]
-                
-                # Process results
-                mask_list, score_list = [], []
-                for m, s in zip(masks, scores):
-                    if hasattr(m, "cpu"): 
-                        m = m.cpu().squeeze(0).numpy()
-                    if hasattr(s, "cpu"): 
-                        s = float(s.cpu())
-                    mask_list.append(m.astype(np.uint8))
-                    score_list.append(float(s))
-                
-                masks_dict[text] = mask_list
-                scores_dict[text] = score_list
-            
-            return masks_dict, scores_dict
-            
-        except Exception as e:
-            raise BackendError(f"SAM3 multi-text inference failed: {e}") from e
-
-
-    def infer_from_exemplar_box(
-        self,
-        image: np.ndarray,
-        box: tuple[int, int, int, int],
-    ) -> tuple[list[np.ndarray], list[float]]:
-        """
-        Visual exemplar box prompt — finds objects similar to the exemplar.
-        Uses SAM3 processor.add_visual_exemplar_prompt() if available.
-        """
-        try:
-            from perceptra_seg.vendor.sam3.visualization_utils import normalize_bbox
-            from perceptra_seg.vendor.sam3.model.box_ops import box_xywh_to_cxcywh
-
-            # Update image state
-            pil = Image.fromarray(image)
-            self._update_state(pil)
-
-            w, h = pil.size
-
-            box_tensor = torch.tensor(box).view(1, 4)    # xyxy
-            box_xywh = torch.tensor([
-                box[0],
-                box[1],
-                box[2] - box[0],
-                box[3] - box[1],
-            ]).view(1, 4)
-
-            cxcywh = box_xywh_to_cxcywh(box_xywh)
-            norm_cxcywh = normalize_bbox(cxcywh, w, h)[0].tolist()
-
-            # Official SAM3 exemplar call
-            output = self.processor.add_geometric_prompt(
-                state=self.inference_state,
-                box=norm_cxcywh,
-                label=True,
-            )
-
-            masks = output["masks"]
-            scores = output["scores"]
-
-            out_masks, out_scores = [], []
-            for m, s in zip(masks, scores):
-                if hasattr(m, "cpu"): m = m.squeeze(0).cpu().numpy()
-                if hasattr(s, "cpu"): s = float(s.cpu())
-                out_masks.append(m.astype(np.uint8))
-                out_scores.append(float(s))
-
-            return out_masks, out_scores
-
-        except Exception as e:
-            raise BackendError(f"SAM3 exemplar inference failed: {e}") from e
-
-    def infer_from_text_and_box(
-        self,
-        image: np.ndarray,
-        text: str,
-        box: tuple[int, int, int, int],
-    ) -> tuple[list[np.ndarray], list[float]]:
-        """
-        Combined text + box prompt.
-        Example: "find blue pipe objects within this box"
-        """
-        try:
-            self._update_state(image)
-
-            # 1. Add geometric box
-            box_np = np.array(box)
-            _ = self.model.predict_inst(
-                self.inference_state,
-                point_coords=None,
-                point_labels=None,
-                box=box_np[None, :],
-                multimask_output=False,
-            )
-
-            # 2. Add text prompt
-            output = self.processor.set_text_prompt(
-                state=self.inference_state,
-                prompt=text,
-            )
-
-            masks, scores = output["masks"], output["scores"]
-            mask_list, score_list = [], []
-
-            for m, s in zip(masks, scores):
-                if hasattr(m, "cpu"): m = m.squeeze(0).cpu().numpy()
-                if hasattr(s, "cpu"): s = float(s.cpu())
-                mask_list.append(m.astype(np.uint8))
-                score_list.append(float(s))
-
-            return mask_list, score_list
-
-        except Exception as e:
-            raise BackendError(f"SAM3 text+box inference failed: {e}") from e
-
-
-    # --- Batch Optimization ---
+            raise BackendError(f"SAM v3 point inference failed: {e}") from e
 
     def infer_from_boxes_batch(
         self, image: np.ndarray, boxes: list[tuple[int, int, int, int]]
     ) -> tuple[list[np.ndarray], list[float]]:
-        """Batch Box Inference."""
-
         try:
             self._update_state(image)
-            input_boxes = np.array(boxes)
-
-            masks, scores, _ = self.model.predict_inst(
-                self.inference_state,
-                point_coords=None,
-                point_labels=None,
-                box=input_boxes,
-                multimask_output=False,
-            )
-
-            # Convert to list of individual masks and scores
-            mask_list = []
-            score_list = []
-            
-            for i in range(masks.shape[0]):
-                mask = masks[i, 0].cpu().numpy().astype(np.uint8)
-                mask_list.append(mask)
-                score_list.append(float(scores[i, 0].cpu()))
-            
-            return mask_list, score_list
+            return self._predict_inst(box=np.array(boxes))
+        except BackendError:
+            raise
         except Exception as e:
-            raise BackendError(f"SAM v3 batch inference failed: {e}") from e
+            raise BackendError(f"SAM v3 batch box inference failed: {e}") from e
 
     def infer_from_points_batch(
         self, image: np.ndarray, points_list: list[list[tuple[int, int, int]]]
     ) -> tuple[list[np.ndarray], list[float]]:
-        """Batch Point Inference."""
         try:
-            self._update_state(image)  # Once
-            
-            mask_list = []
-            score_list = []
-            
-            # Iterate over each point set (SAM3 may not support multi-prompt batching)
+            self._update_state(image)
+            mask_list, score_list = [], []
             for points in points_list:
-                coords = np.array([[p[0], p[1]] for p in points])
-                labels = np.array([p[2] for p in points])
-                
-                masks, scores, _ = self.model.predict_inst(
-                    self.inference_state,
-                    point_coords=coords,
-                    point_labels=labels,
-                    multimask_output=False,
+                masks, scores = self._predict_inst(
+                    point_coords=np.array([[x, y] for x, y, _ in points]),
+                    point_labels=np.array([label for _, _, label in points]),
                 )
-                
-                mask_list.append(masks[0].astype(np.uint8))
-                score_list.append(float(scores[0]))
-                
+                mask_list.append(masks[0])
+                score_list.append(scores[0])
             return mask_list, score_list
-            
+        except BackendError:
+            raise
         except Exception as e:
-            raise BackendError(f"SAM v3 batch inference failed: {e}") from e
+            raise BackendError(f"SAM v3 batch point inference failed: {e}") from e
+
+    # --- Concept prompts (text / exemplar) ---
+
+    def infer_from_text(self, image: np.ndarray, text: str) -> tuple[list[np.ndarray], list[float]]:
+        """Find every instance of the concept described by ``text``."""
+        try:
+            self._update_state(image)
+            with self._autocast():
+                self.processor.set_text_prompt(state=self.inference_state, prompt=text)
+            return self._concept_outputs()
+        except BackendError:
+            raise
+        except Exception as e:
+            raise BackendError(f"SAM3 text inference failed: {e}") from e
+
+    def infer_from_text_batch(
+        self, image: np.ndarray, text_prompts: list[str]
+    ) -> tuple[dict[str, list[np.ndarray]], dict[str, list[float]]]:
+        """Run several text prompts against one shared image encoding."""
+        try:
+            self._update_state(image)
+            masks_dict: dict[str, list[np.ndarray]] = {}
+            scores_dict: dict[str, list[float]] = {}
+            for text in text_prompts:
+                self.processor.reset_all_prompts(self.inference_state)
+                with self._autocast():
+                    self.processor.set_text_prompt(state=self.inference_state, prompt=text)
+                masks_dict[text], scores_dict[text] = self._concept_outputs()
+            return masks_dict, scores_dict
+        except BackendError:
+            raise
+        except Exception as e:
+            raise BackendError(f"SAM3 multi-text inference failed: {e}") from e
+
+    def infer_from_exemplar_box(
+        self, image: np.ndarray, box: tuple[int, int, int, int]
+    ) -> tuple[list[np.ndarray], list[float]]:
+        """Find every object visually similar to the exemplar inside ``box``."""
+        try:
+            self._update_state(image)
+            h, w = image.shape[:2]
+            with self._autocast():
+                self.processor.add_geometric_prompt(
+                    state=self.inference_state, box=_xyxy_to_norm_cxcywh(box, w, h), label=True
+                )
+            return self._concept_outputs()
+        except BackendError:
+            raise
+        except Exception as e:
+            raise BackendError(f"SAM3 exemplar inference failed: {e}") from e
+
+    def infer_from_text_and_box(
+        self, image: np.ndarray, text: str, box: tuple[int, int, int, int]
+    ) -> tuple[list[np.ndarray], list[float]]:
+        """Concept prompt combining text with a positive visual exemplar box."""
+        try:
+            self._update_state(image)
+            h, w = image.shape[:2]
+            with self._autocast():
+                self.processor.set_text_prompt(state=self.inference_state, prompt=text)
+                self.processor.add_geometric_prompt(
+                    state=self.inference_state, box=_xyxy_to_norm_cxcywh(box, w, h), label=True
+                )
+            return self._concept_outputs()
+        except BackendError:
+            raise
+        except Exception as e:
+            raise BackendError(f"SAM3 text+box inference failed: {e}") from e
 
     def close(self) -> None:
-        """Clean up resources."""
         self.inference_state = None
-        self._cached_image_hash = None  # Clear cache
-
-        if self.model is not None:
-            del self.model
-        if self.processor is not None:
-            del self.processor
-        
+        self._cached_image_hash = None
+        self.processor = None
+        self.model = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

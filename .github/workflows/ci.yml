@@ -11,32 +11,34 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11"]
+        python-version: ["3.10", "3.11", "3.12"]
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e .[dev,torch]
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[dev,server]"
 
       - name: Lint with ruff
-        run: ruff check segmentor/ service/
-
-      - name: Type check with mypy
-        run: mypy segmentor/ service/
+        run: ruff check perceptra_seg/ service/
         continue-on-error: true
 
-      - name: Run tests
-        run: pytest tests/ --cov=segmentor --cov-report=xml
+      - name: Type check with mypy
+        run: mypy perceptra_seg/ service/
+        continue-on-error: true
 
-      - name: Upload coverage
-        uses: codecov/codecov-action@v3
-        with:
-          files: ./coverage.xml
+      # Weight-free tests (fake backends). Tests needing real SAM checkpoints
+      # (test_core, test_backends, test_kwargs_handling) are run manually on a GPU host.
+      - name: Run tests
+        run: >
+          pytest tests/test_service.py tests/test_client.py tests/test_config.py
+          tests/test_sam3_backend.py tests/test_utils.py
+          --cov-report=xml

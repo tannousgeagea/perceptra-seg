@@ -169,12 +169,13 @@ seg.close()
 
 ```bash
 # Build image
-docker build -t segmentor:latest -f Dockerfile.gpu .
+docker build -t segmentor:latest .
 
-# Run with GPU
+# Run with GPU (weights persist in the perceptra-models volume)
 docker run --gpus all -p 8080:8080 \
   -e SEGMENTOR_RUNTIME_DEVICE=cuda \
   -e SEGMENTOR_MODEL_NAME=sam_v2 \
+  -v perceptra-models:/models \
   segmentor:latest
 
 # Test

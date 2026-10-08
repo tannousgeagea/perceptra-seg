@@ -1,13 +1,13 @@
 """PyTorch backend for SAM v1."""
 
 import logging
-from pathlib import Path
 
 import numpy as np
 import torch
 
 from typing import Any
 from perceptra_seg.config import SegmentorConfig
+from perceptra_seg.utils.checkpoints import download_checkpoint
 from perceptra_seg.exceptions import BackendError, ModelLoadError
 
 logger = logging.getLogger(__name__)
@@ -64,19 +64,7 @@ class TorchSAMv1Backend:
         if not url:
             raise ModelLoadError(f"Unknown encoder variant: {variant}")
 
-        # Download to cache
-        cache_dir = Path.home() / ".cache" / "segmentor"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_path = cache_dir / f"sam_v1_{variant}.pth"
-
-        if not checkpoint_path.exists():
-            logger.info(f"Downloading SAM v1 checkpoint from {url}")
-            import urllib.request
-
-            urllib.request.urlretrieve(url, checkpoint_path)
-            logger.info(f"Saved to {checkpoint_path}")
-
-        return str(checkpoint_path)
+        return download_checkpoint(url, f"sam_v1_{variant}.pth")
 
     def infer_from_box(
         self, image: np.ndarray, box: tuple[int, int, int, int]

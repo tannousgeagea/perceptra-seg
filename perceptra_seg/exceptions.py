@@ -35,3 +35,8 @@ class ImageLoadError(SegmentorError):
     """Raised when image cannot be loaded."""
 
     pass
+
+class UnsupportedOperationError(SegmentorError):
+    """Raised when the loaded model does not support the requested prompt type."""
+
+    pass
