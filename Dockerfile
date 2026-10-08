@@ -29,13 +29,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     HF_HOME=/models/huggingface \
-    PERCEPTRA_SEG_CACHE_DIR=/models/perceptra-seg
+    PERCEPTRA_SEG_CACHE_DIR=/models/perceptra-seg \
+    PATH=/opt/venv/bin:$PATH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         libgl1 \
         libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
+
+# The base image's Python is OS-managed (PEP 668) and has no ensurepip, so install into
+# a venv that still sees the base image's torch/triton via --system-site-packages.
+RUN python3 -m venv --without-pip --system-site-packages /opt/venv
 
 WORKDIR /app
 
@@ -50,8 +55,8 @@ COPY config.yaml ./
 # requirement, which would otherwise download a second multi-GB copy);
 # SAM2_BUILD_CUDA=0 skips sam2's optional CUDA extension (no nvcc in a runtime image).
 RUN --mount=type=bind,from=sam3-src,target=/tmp/sam3,rw \
-    pip install --upgrade pip "setuptools<81" wheel \
-    && SAM2_BUILD_CUDA=0 pip install --no-build-isolation \
+    python -m pip install --upgrade pip "setuptools<81" wheel \
+    && SAM2_BUILD_CUDA=0 python -m pip install --no-build-isolation \
         ".[server,sam3]" \
         /tmp/sam3 \
         "SAM-2 @ git+https://github.com/facebookresearch/sam2.git@${SAM2_REF}" \
@@ -61,7 +66,9 @@ RUN --mount=type=bind,from=sam3-src,target=/tmp/sam3,rw \
     && cat /app/build-info.json \
     && python -c "import sam3, sam2, segment_anything, perceptra_seg, service.main"
 
-RUN useradd -m -u 1000 segmentor \
+# Ubuntu 24.04 bases ship a default "ubuntu" user on UID 1000.
+RUN (userdel -r ubuntu 2>/dev/null || true) \
+    && useradd -m -u 1000 segmentor \
     && mkdir -p /models \
     && chown -R segmentor:segmentor /app /models
 USER segmentor
