@@ -49,12 +49,32 @@ class FakeGeometricBackend:
         results = [self.infer_from_points(image, pts) for pts in points_list]
         return [m for m, _ in results], [s for _, s in results]
 
+    def generate_all(self, image, **kwargs):
+        self._enter()
+        h, w = image.shape[:2]
+        return [
+            {"segmentation": _box_mask(image.shape, (0, 0, w // 2, h // 2)).astype(bool), "predicted_iou": 0.9},
+            {"segmentation": _box_mask(image.shape, (w // 2, h // 2, w, h)).astype(bool), "predicted_iou": 0.8},
+        ]
+
+    # Mirrors the real SAM v1/v2 backends, which stub concept prompts out.
+    def infer_from_text(self, image, text):
+        raise NotImplementedError
+
+    def infer_from_exemplar_box(self, image, box):
+        raise NotImplementedError
+
+    def infer_from_text_and_box(self, image, text, box):
+        raise NotImplementedError
+
     def close(self) -> None:
         pass
 
 
 class FakeConceptBackend(FakeGeometricBackend):
-    """Adds the SAM3 concept-prompt surface."""
+    """Adds the SAM3 concept-prompt surface (and, like SAM3, has no auto-segmentation)."""
+
+    generate_all = None
 
     def infer_from_text(self, image, text):
         self._enter()

@@ -656,16 +656,28 @@ class Segmentor:
             self.backend = None
 
     def _backend_method(self, name: str) -> Any:
-        """Return a backend capability, or raise if the loaded model lacks it."""
+        """Return a backend capability, or raise if the loaded model lacks it.
+
+        Backends may omit a method or define it as a stub raising NotImplementedError;
+        both surface as UnsupportedOperationError.
+        """
         if self.backend is None:
             raise BackendError("Backend not loaded")
+        unsupported = UnsupportedOperationError(
+            f"'{self.config.runtime.backend}_{self.config.model.name}' does not support {name}; "
+            "text/exemplar prompts require sam_v3, auto-segmentation requires sam_v1/sam_v2"
+        )
         method = getattr(self.backend, name, None)
         if method is None:
-            raise UnsupportedOperationError(
-                f"'{self.config.runtime.backend}_{self.config.model.name}' does not support {name}; "
-                "text/exemplar prompts require sam_v3, auto-segmentation requires sam_v1/sam_v2"
-            )
-        return method
+            raise unsupported
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return method(*args, **kwargs)
+            except NotImplementedError as e:
+                raise unsupported from e
+
+        return call
 
     def _validate_box(
         self, box: tuple[int, int, int, int], image_shape: tuple[int, int, int]

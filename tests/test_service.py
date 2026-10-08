@@ -128,10 +128,22 @@ def test_segment_exemplar(client: TestClient, image_b64: str) -> None:
     assert len(response.json()) == 1
 
 
-def test_text_on_geometric_model_is_400(client: TestClient, image_b64: str) -> None:
-    response = client.post("/v1/segment/text?model=sam_v2", json={"image": image_b64, "text": "square"})
+@pytest.mark.parametrize(
+    "path, payload, model",
+    [
+        ("/v1/segment/text", {"text": "square"}, "sam_v2"),
+        ("/v1/segment/text", {"text": "square", "box": [20, 20, 80, 80]}, "sam_v2"),
+        ("/v1/segment/text/batch", {"texts": ["square"]}, "sam_v2"),
+        ("/v1/segment/exemplar", {"exemplar_box": [20, 20, 80, 80]}, "sam_v2"),
+        ("/v1/segment/auto", {}, "sam_v3"),
+    ],
+)
+def test_unsupported_prompt_for_model_is_400(
+    client: TestClient, image_b64: str, path: str, payload: dict, model: str
+) -> None:
+    response = client.post(f"{path}?model={model}", json={"image": image_b64, **payload})
     assert response.status_code == 400
-    assert "sam_v3" in response.json()["detail"]
+    assert "does not support" in response.json()["detail"]
 
 
 def test_segment_general_merge(client: TestClient, image_b64: str) -> None:
