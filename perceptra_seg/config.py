@@ -81,7 +81,8 @@ class ServerConfig(BaseModel):
     api_keys: list[str] = Field(default_factory=list)
     max_image_size_mb: int = 20
     max_image_dimension: int = 8000
-    request_timeout: int = 30
+    request_timeout: float = 30  # seconds a request may wait for its model before a 503
+    max_queue_per_model: int = 16  # admitted requests per model (running + waiting); beyond -> 429
 
 
 class LoggingConfig(BaseModel):

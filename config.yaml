@@ -46,7 +46,8 @@ server:
   api_keys: []  # Empty = no auth
   max_image_size_mb: 20
   max_image_dimension: 8000
-  request_timeout: 30
+  request_timeout: 30  # max seconds waiting for the model -> 503
+  max_queue_per_model: 16  # admitted requests per model -> 429 beyond
 
 logging:
   level: "INFO"  # DEBUG | INFO | WARNING | ERROR

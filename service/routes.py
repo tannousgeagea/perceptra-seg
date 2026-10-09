@@ -5,7 +5,6 @@ import binascii
 import io
 import logging
 import secrets
-import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +13,8 @@ from PIL import Image
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
+from service.gate import QUEUE_DEPTH, REJECTED, OverloadedError
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -21,23 +22,30 @@ router = APIRouter()
 
 @dataclass
 class LoadedModel:
-    """A loaded Segmentor plus the lock serialising access to it.
+    """A loaded Segmentor plus admission control for it.
 
-    Backends keep per-image state (cached embeddings, prompt state), so a model must
-    only serve one request at a time. Inference runs in a worker thread so the event
-    loop keeps serving health checks and other models meanwhile.
+    The segmentor's backend is wrapped in a ``GpuGate``, so only the model call itself is
+    exclusive; image loading and post-processing of concurrent requests overlap. At most
+    ``max_pending`` requests are admitted per model (running + waiting); beyond that the
+    request is rejected with 429 before it takes a worker thread.
     """
 
     name: str
     segmentor: Any
-    lock: threading.Lock
+    max_pending: int = 16
+    pending: int = 0  # only touched on the event loop
 
     async def run(self, method: str, **kwargs: Any) -> Any:
-        def _call() -> Any:
-            with self.lock:
-                return getattr(self.segmentor, method)(**kwargs)
-
-        return await run_in_threadpool(_call)
+        if self.pending >= self.max_pending:
+            REJECTED.labels(self.name, "queue_full").inc()
+            raise OverloadedError(self.name)
+        self.pending += 1
+        QUEUE_DEPTH.labels(self.name).inc()
+        try:
+            return await run_in_threadpool(getattr(self.segmentor, method), **kwargs)
+        finally:
+            self.pending -= 1
+            QUEUE_DEPTH.labels(self.name).dec()
 
 
 # Request models
@@ -221,6 +229,8 @@ async def health_check(request: Request) -> dict[str, Any]:
             "loaded": True,
             "device": entry.segmentor.config.runtime.device,
             "precision": entry.segmentor.config.runtime.precision,
+            "pending": entry.pending,
+            "max_pending": entry.max_pending,
         }
         for name, entry in models.items()
     }

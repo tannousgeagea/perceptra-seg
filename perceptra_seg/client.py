@@ -10,6 +10,8 @@ talks to a deployed instance:
 
 import base64
 import io
+import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -56,7 +58,11 @@ class SegmentorClient:
         timeout: Per-request timeout in seconds.
         default_model: Model used when a call does not pass ``model``; ``None`` lets the
             server use its primary model.
+        max_retries: Retries when the server is busy (429 queue full, 503 wait timeout),
+            honouring ``Retry-After`` with jitter. ``0`` disables retrying.
     """
+
+    _RETRY_STATUSES = (429, 503)
 
     def __init__(
         self,
@@ -64,8 +70,10 @@ class SegmentorClient:
         api_key: str | None = None,
         timeout: float = 120.0,
         default_model: str | None = None,
+        max_retries: int = 2,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        self.max_retries = max_retries
         self.timeout = timeout
         self.default_model = default_model
         self.session = requests.Session()
@@ -74,13 +82,17 @@ class SegmentorClient:
 
     def _request(self, method: str, path: str, model: str | None = None, **kwargs: Any) -> Any:
         model = model or self.default_model
-        response = self.session.request(
-            method,
-            f"{self.base_url}/v1{path}",
-            params={"model": model} if model else None,
-            timeout=self.timeout,
-            **kwargs,
-        )
+        for attempt in range(self.max_retries + 1):
+            response = self.session.request(
+                method,
+                f"{self.base_url}/v1{path}",
+                params={"model": model} if model else None,
+                timeout=self.timeout,
+                **kwargs,
+            )
+            if response.status_code not in self._RETRY_STATUSES or attempt == self.max_retries:
+                break
+            time.sleep(self._retry_delay(response, attempt))
         if not response.ok:
             try:
                 detail = response.json().get("detail", response.text)
@@ -88,6 +100,14 @@ class SegmentorClient:
                 detail = response.text
             raise SegmentorAPIError(response.status_code, detail)
         return response.json()
+
+    @staticmethod
+    def _retry_delay(response: requests.Response, attempt: int) -> float:
+        try:
+            base = float(response.headers.get("Retry-After", ""))
+        except ValueError:
+            base = 0.5 * 2**attempt
+        return base * random.uniform(0.5, 1.5)
 
     def _post(self, path: str, payload: dict[str, Any], model: str | None) -> Any:
         return self._request("POST", path, model=model, json=payload)

@@ -3,25 +3,26 @@
 import json
 import logging
 import os
-import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import anyio.to_thread
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
 
 from perceptra_seg.__version__ import __version__
-from perceptra_seg.config import SegmentorConfig
+from perceptra_seg.config import SegmentorConfig, ServerConfig
 from perceptra_seg.exceptions import (
     ImageLoadError,
     InvalidPromptError,
     SegmentorError,
     UnsupportedOperationError,
 )
+from service.gate import GpuGate, OverloadedError, QueueTimeoutError
 from service.middleware import LoggingMiddleware
 from service.routes import LoadedModel, router
 
@@ -68,6 +69,13 @@ def _build_config_for(base: SegmentorConfig, model_name: str) -> SegmentorConfig
     return cfg
 
 
+def _serve(name: str, segmentor: Any, server: ServerConfig) -> LoadedModel:
+    """Gate the segmentor's backend and wrap it with admission control."""
+    if segmentor.backend is not None and not isinstance(segmentor.backend, GpuGate):
+        segmentor.backend = GpuGate(name, segmentor.backend, server.request_timeout)
+    return LoadedModel(name=name, segmentor=segmentor, max_pending=server.max_queue_per_model)
+
+
 def _load_models(base: SegmentorConfig, names: list[str]) -> dict[str, LoadedModel]:
     from perceptra_seg import Segmentor
 
@@ -75,7 +83,7 @@ def _load_models(base: SegmentorConfig, names: list[str]) -> dict[str, LoadedMod
     for name in names:
         try:
             cfg = _build_config_for(base, name)
-            models[name] = LoadedModel(name=name, segmentor=Segmentor(config=cfg), lock=threading.Lock())
+            models[name] = _serve(name, Segmentor(config=cfg), base.server)
             logger.info("Model loaded: %s (device=%s precision=%s)",
                         name, cfg.runtime.device, cfg.runtime.precision)
         except Exception:
@@ -99,10 +107,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if models is not None:
-            loaded = {
-                name: LoadedModel(name=name, segmentor=seg, lock=threading.Lock())
-                for name, seg in models.items()
-            }
+            loaded = {name: _serve(name, seg, base_config.server) for name, seg in models.items()}
             primary = next(iter(loaded), None)
         else:
             names = _parse_model_names()
@@ -111,6 +116,11 @@ def create_app(
             primary = next((n for n in names if n in loaded), None)
             if not loaded:
                 logger.error("No models loaded — service will return 503 on inference requests")
+
+        # Every admitted request holds a worker thread while it runs or waits for its model;
+        # size the pool so admitted requests never queue for a thread.
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        limiter.total_tokens = max(limiter.total_tokens, sum(m.max_pending for m in loaded.values()) + 8)
 
         app.state.models = loaded
         app.state.primary_model = primary
@@ -152,6 +162,15 @@ def create_app(
     @app.exception_handler(ImageLoadError)
     async def _bad_request(_: Request, exc: SegmentorError) -> JSONResponse:
         return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @app.exception_handler(OverloadedError)
+    async def _overloaded(_: Request, exc: OverloadedError) -> JSONResponse:
+        return JSONResponse(status_code=429, content={"detail": str(exc)}, headers={"Retry-After": "1"})
+
+    @app.exception_handler(QueueTimeoutError)
+    async def _queue_timeout(_: Request, exc: QueueTimeoutError) -> JSONResponse:
+        logger.warning("%s", exc)
+        return JSONResponse(status_code=503, content={"detail": str(exc)}, headers={"Retry-After": "1"})
 
     @app.exception_handler(SegmentorError)
     async def _segmentor_error(_: Request, exc: SegmentorError) -> JSONResponse:

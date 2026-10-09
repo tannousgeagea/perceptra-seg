@@ -210,6 +210,7 @@ server:
   max_image_size_mb: 20
   max_image_dimension: 8000
   request_timeout: 30
+  max_queue_per_model: 16
 ```
 
 ### `server.host`
@@ -248,9 +249,16 @@ server:
 - **Description**: Maximum image dimension in pixels
 
 ### `server.request_timeout`
-- **Type**: `integer`
+- **Type**: `float`
 - **Default**: `30`
-- **Description**: Request timeout in seconds
+- **Description**: Seconds a request may wait for its model (another request is using it) before the
+  service answers 503 with `Retry-After`
+
+### `server.max_queue_per_model`
+- **Type**: `integer`
+- **Default**: `16`
+- **Description**: Requests admitted per model (running + waiting). Further requests get 429 with
+  `Retry-After` immediately instead of queueing without bound
 
 ## Logging Configuration
 

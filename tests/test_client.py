@@ -69,3 +69,46 @@ def test_client_errors(base_url: str, image: np.ndarray) -> None:
         client.segment_text(image, "square")
     assert exc.value.status_code == 400
     assert "sam_v3" in str(exc.value.detail)
+
+
+def _response(status: int, body: str = '{"ok": true}', retry_after: str | None = None):
+    import requests
+
+    response = requests.Response()
+    response.status_code = status
+    response._content = body.encode()
+    if retry_after is not None:
+        response.headers["Retry-After"] = retry_after
+    return response
+
+
+@pytest.mark.parametrize("busy_status", [429, 503])
+def test_client_retries_when_busy(monkeypatch: pytest.MonkeyPatch, busy_status: int) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr("perceptra_seg.client.time.sleep", sleeps.append)
+    client = SegmentorClient("http://seg")
+    replies = iter([_response(busy_status, '{"detail": "busy"}', retry_after="1"), _response(200)])
+    monkeypatch.setattr(client.session, "request", lambda *a, **kw: next(replies))
+    assert client.health() == {"ok": True}
+    assert len(sleeps) == 1 and 0.5 <= sleeps[0] <= 1.5
+
+
+def test_client_gives_up_after_max_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("perceptra_seg.client.time.sleep", lambda _: None)
+    calls = []
+
+    def busy(*args, **kwargs):
+        calls.append(1)
+        return _response(429, '{"detail": "busy"}')
+
+    client = SegmentorClient("http://seg", max_retries=0)
+    monkeypatch.setattr(client.session, "request", busy)
+    with pytest.raises(SegmentorAPIError) as exc:
+        client.health()
+    assert exc.value.status_code == 429 and len(calls) == 1
+
+    client.max_retries = 2
+    calls.clear()
+    with pytest.raises(SegmentorAPIError):
+        client.health()
+    assert len(calls) == 3

@@ -3,6 +3,7 @@
 import base64
 import io
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -194,13 +195,90 @@ def test_api_keys_from_env(monkeypatch: pytest.MonkeyPatch, image_b64: str) -> N
         assert c.post("/v1/segment/box", json=payload, headers={"Authorization": "Bearer beta"}).status_code == 200
 
 
+def _post_concurrently(c: TestClient, path: str, payload: dict, n: int) -> list:
+    responses: list = [None] * n
+
+    def post(i: int) -> None:
+        responses[i] = c.post(path, json=payload)
+
+    threads = [threading.Thread(target=post, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return responses
+
+
 def test_requests_to_one_model_are_serialized(config: SegmentorConfig, image_b64: str) -> None:
     backend = FakeConceptBackend(delay=0.05)
     with TestClient(create_app(config, models={"sam_v3": make_segmentor(backend=backend)})) as c:
-        payload = {"image": image_b64, "box": [20, 20, 80, 80]}
-        threads = [threading.Thread(target=c.post, args=("/v1/segment/box",), kwargs={"json": payload}) for _ in range(4)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        responses = _post_concurrently(c, "/v1/segment/box", {"image": image_b64, "box": [20, 20, 80, 80]}, 4)
+    assert [r.status_code for r in responses] == [200] * 4
     assert backend.max_active == 1
+
+
+def test_preprocessing_runs_outside_the_model_lock(
+    config: SegmentorConfig, image_b64: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import perceptra_seg.core as core
+
+    real_load_image = core.load_image
+
+    def slow_load_image(*args, **kwargs):
+        time.sleep(0.3)
+        return real_load_image(*args, **kwargs)
+
+    monkeypatch.setattr(core, "load_image", slow_load_image)
+    backend = FakeConceptBackend(delay=0.05)
+    with TestClient(create_app(config, models={"sam_v3": make_segmentor(backend=backend)})) as c:
+        start = time.perf_counter()
+        responses = _post_concurrently(c, "/v1/segment/box", {"image": image_b64, "box": [20, 20, 80, 80]}, 4)
+        elapsed = time.perf_counter() - start
+    assert [r.status_code for r in responses] == [200] * 4
+    assert backend.max_active == 1
+    assert elapsed < 0.9  # serialised end to end this takes 4 * (0.3 + 0.05) = 1.4s
+
+
+def test_full_queue_is_429(config: SegmentorConfig, image_b64: str) -> None:
+    config.server.max_queue_per_model = 2
+    backend = FakeConceptBackend(delay=0.5)
+    with TestClient(create_app(config, models={"sam_v3": make_segmentor(backend=backend)})) as c:
+        responses = _post_concurrently(c, "/v1/segment/box", {"image": image_b64, "box": [20, 20, 80, 80]}, 4)
+        assert sorted(r.status_code for r in responses) == [200, 200, 429, 429]
+        rejected = next(r for r in responses if r.status_code == 429)
+        assert rejected.headers["Retry-After"] == "1"
+        assert c.get("/v1/healthz").json()["models"]["sam_v3"] == {
+            "loaded": True, "device": "cpu", "precision": "fp32", "pending": 0, "max_pending": 2,
+        }
+        metrics = c.get("/metrics/").text
+    assert 'perceptra_rejected_total{model="sam_v3",reason="queue_full"}' in metrics
+    assert "perceptra_gpu_wait_seconds_bucket" in metrics
+    assert 'perceptra_inference_seconds_count{method="infer_from_box",model="sam_v3"}' in metrics
+
+
+def test_model_wait_deadline_is_503(config: SegmentorConfig, image_b64: str) -> None:
+    config.server.request_timeout = 0.05
+    backend = FakeConceptBackend(delay=0.5)
+    with TestClient(create_app(config, models={"sam_v3": make_segmentor(backend=backend)})) as c:
+        responses = _post_concurrently(c, "/v1/segment/box", {"image": image_b64, "box": [20, 20, 80, 80]}, 2)
+    assert sorted(r.status_code for r in responses) == [200, 503]
+    timed_out = next(r for r in responses if r.status_code == 503)
+    assert timed_out.headers["Retry-After"] == "1"
+    assert "did not become available" in timed_out.json()["detail"]
+
+
+def test_gate_passes_through_capabilities_and_close() -> None:
+    from service.gate import GpuGate
+
+    class Backend(FakeConceptBackend):
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    backend = Backend()
+    gate = GpuGate("sam_v3", backend, wait_timeout=1)
+    assert gate.generate_all is None  # unsupported capability stays detectable
+    assert gate.delay == 0.0
+    gate.close()
+    assert backend.closed

@@ -141,8 +141,17 @@ curl http://localhost:29086/v1/healthz
   persist across restarts and rebuilds. To warm the cache before a deploy:
   `docker compose run --rm perceptra-seg python scripts/download_sam3.py`.
 - **Auth**: set `SEG_API_KEYS=key1,key2`; clients send `Authorization: Bearer <key>`. `/v1/healthz` and `/metrics` stay public.
-- **Models**: `SEG_MODELS=sam_v3,sam_v2` loads both; the first is the default. Requests to one model are
-  processed one at a time (models keep per-image state); different models run concurrently.
+- **Models**: `SEG_MODELS=sam_v3,sam_v2` loads both; the first is the default.
+- **Concurrency**: each model runs one inference at a time (models keep per-image state); different models
+  run concurrently. Image decoding/fetching, validation and post-processing (RLE, polygons, PNG) run outside
+  that lock, so concurrent requests overlap everywhere except the GPU call.
+  - Each model admits at most `SEGMENTOR_SERVER_MAX_QUEUE_PER_MODEL` requests (running + waiting, default 16);
+    beyond that the service answers **429** with `Retry-After`.
+  - A request that waits longer than `SEGMENTOR_SERVER_REQUEST_TIMEOUT` seconds (default 30) for its model
+    gets **503** with `Retry-After`.
+  - `SegmentorClient` retries 429/503 (`max_retries=2` by default, `0` disables it).
+  - `/metrics`: `perceptra_queue_depth`, `perceptra_gpu_wait_seconds`, `perceptra_inference_seconds`,
+    `perceptra_rejected_total`, `perceptra_image_repeat_total`; `/v1/healthz` shows `pending`/`max_pending` per model.
 - **Limits**: `SEGMENTOR_SERVER_MAX_IMAGE_SIZE_MB` / `SEGMENTOR_SERVER_MAX_IMAGE_DIMENSION` (413 when exceeded).
 - Any config value can be overridden with `SEGMENTOR_<SECTION>_<FIELD>`, or mount a YAML file and set `SEGMENTOR_CONFIG=/path/config.yaml`.
 
