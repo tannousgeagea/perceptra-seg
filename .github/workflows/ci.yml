@@ -40,5 +40,5 @@ jobs:
       - name: Run tests
         run: >
           pytest tests/test_service.py tests/test_client.py tests/test_config.py
-          tests/test_sam3_backend.py tests/test_utils.py
+          tests/test_sam3_backend.py tests/test_backend_common.py tests/test_utils.py
           --cov-report=xml
