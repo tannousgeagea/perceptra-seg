@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 
 class ModelConfig(BaseModel):
@@ -23,7 +23,7 @@ class RuntimeConfig(BaseModel):
     device: str = "cuda"
     precision: Literal["fp16", "bf16", "fp32"] = "fp32"
     batch_size: int = 1
-    enable_batch_inference: bool = True 
+    enable_batch_inference: bool = True
     deterministic: bool = True
     seed: int = 42
 
@@ -52,6 +52,7 @@ class ThresholdsConfig(BaseModel):
 
     mask_threshold: float = 0.5
     iou_threshold: float = 0.88
+    concept_confidence_threshold: float = 0.5  # SAM3 text/exemplar detections below this are dropped
 
 
 class PostprocessConfig(BaseModel):
@@ -131,20 +132,24 @@ class SegmentorConfig(BaseModel):
         return cls(**data)
 
     def apply_env_overrides(self) -> None:
-        """Apply environment variable overrides."""
-        # Example: SEGMENTOR_RUNTIME_DEVICE=cpu
+        """Apply environment variable overrides.
+
+        ``SEGMENTOR_<SECTION>_<FIELD>=value``, e.g. ``SEGMENTOR_RUNTIME_DEVICE=cpu``.
+        Values are validated/coerced by pydantic; list fields take comma-separated values
+        (``SEGMENTOR_SERVER_API_KEYS=key1,key2``). Unknown keys are ignored.
+        """
         prefix = "SEGMENTOR_"
         for key, value in os.environ.items():
             if not key.startswith(prefix):
                 continue
-            parts = key[len(prefix) :].lower().split("_")
-            if len(parts) < 2:
+            section, _, field = key[len(prefix) :].lower().partition("_")
+            section_obj = getattr(self, section, None)
+            if not isinstance(section_obj, BaseModel) or field not in type(section_obj).model_fields:
                 continue
 
-            section = parts[0]
-            field = "_".join(parts[1:])
-
-            if hasattr(self, section):
-                section_obj = getattr(self, section)
-                if hasattr(section_obj, field):
-                    setattr(section_obj, field, value)
+            parsed: Any = value
+            if isinstance(getattr(section_obj, field), list):
+                parsed = [v.strip() for v in value.split(",") if v.strip()]
+            data = section_obj.model_dump()
+            data[field] = parsed
+            setattr(self, section, type(section_obj).model_validate(data))

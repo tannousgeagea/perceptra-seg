@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "perceptra-seg"
-version = "0.2.1"
-description = "Production-grade segmentation tool with SAM v1/v2 support"
+version = "0.3.0"
+description = "Production-grade segmentation tool with SAM v1/v2/v3 support"
 authors = [{name = "Tannous Geagea", email = "tannousgeagea@hotmail.com"}]
 readme = "README.md"
 requires-python = ">=3.10"
@@ -58,24 +58,15 @@ dev = [
     "httpx>=0.25.0",
 ]
 
+# SAM3 model code is installed from the official repo (always latest):
+#   pip install "git+https://github.com/facebookresearch/sam3.git"
+# These are runtime imports of sam3 that it does not declare itself
+# (it imports pkg_resources, which setuptools>=81 no longer ships).
 sam3 = [
-    "timm>=1.0.17",
-    "numpy==1.26",
-    "tqdm",
-    "ftfy==6.1.1",
-    "regex",
-    "iopath>=0.1.10",
-    "typing_extensions",
-    "huggingface_hub",
-    "pycocotools",
-    "decord",
-    "opencv-python",
     "einops",
-    "scikit-image",
-    "scikit-learn",
-    "matplotlib",
+    "pycocotools",
     "psutil",
-    "pandas",
+    "setuptools<81",
 ]
 
 docs = [
@@ -121,4 +112,4 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v --cov=perceptra-seg --cov-report=html --cov-report=term"
+addopts = "-v --cov=perceptra_seg --cov=service --cov-report=term"

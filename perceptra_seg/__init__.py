@@ -21,6 +21,7 @@ from perceptra_seg.exceptions import (
     InvalidPromptError,
     ModelLoadError,
     SegmentorError,
+    UnsupportedOperationError,
 )
 from perceptra_seg.models import SegmentationResult
 
@@ -35,6 +36,7 @@ __all__ = [
     "InvalidPromptError",
     "BackendError",
     "ConfigError",
+    "UnsupportedOperationError",
     # Version info
     "__version__",
     "__author__",
@@ -43,6 +45,6 @@ __all__ = [
 
 # Package metadata
 __title__ = "segmentor"
-__description__ = "Production-grade segmentation tool with SAM v1/v2 support"
+__description__ = "Production-grade segmentation tool with SAM v1/v2/v3 support"
 __url__ = "https://github.com/tannousgeagea/segmentor"
 __license__ = "Apache-2.0"

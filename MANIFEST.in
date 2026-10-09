@@ -2,10 +2,9 @@
 include README.md
 include LICENSE
 include config.yaml
-include requirements/*.txt
 
 # Include type information
-include segmentor/py.typed
+include perceptra_seg/py.typed
 
 # Exclude unnecessary files
 exclude .gitignore
