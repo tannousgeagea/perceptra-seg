@@ -37,7 +37,18 @@ class TorchSAMv1Backend:
             sam = sam_model_registry[model_type](checkpoint=checkpoint_path)
             sam.to(device=self.device)
 
+            # Compiled under fp16/bf16 autocast the masks drift (IoU ~0.9 vs eager); fp32 is exact.
+            compile_encoder = self.config.runtime.compile and self.config.runtime.precision == "fp32"
+            if self.config.runtime.compile and not compile_encoder:
+                logger.info("runtime.compile is ignored for SAM v1 unless precision is fp32")
+            if compile_encoder:
+                sam.image_encoder = torch.compile(sam.image_encoder)
             self.predictor = SamPredictor(sam)
+            if compile_encoder:
+                logger.info("Compiling SAM v1 image encoder (one-time warm-up)...")
+                with self._autocast():
+                    self.predictor.set_image(np.zeros((1024, 1024, 3), dtype=np.uint8))
+                self.predictor.reset_image()
             if self.config.runtime.precision == "bf16":
                 logger.info("SAM v1 runs bf16 precision as fp16 autocast")
             logger.info(

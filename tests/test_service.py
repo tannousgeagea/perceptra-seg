@@ -282,3 +282,32 @@ def test_gate_passes_through_capabilities_and_close() -> None:
     assert gate.delay == 0.0
     gate.close()
     assert backend.closed
+
+
+def test_app_logs_follow_logging_config(config: SegmentorConfig, image_b64: str, tmp_path) -> None:
+    import json as _json
+
+    log_file = tmp_path / "service.log"
+    config.logging.log_file = str(log_file)
+    with TestClient(create_app(config, models={"sam_v3": make_segmentor()})) as c:
+        c.get("/v1/healthz")
+        c.get("/metrics/")
+        assert c.post("/v1/segment/box", json={"image": image_b64, "box": [20, 20, 80, 80]}).status_code == 200
+    import logging as _logging
+
+    _logging.getLogger("perceptra_seg.test").info("plain message")
+    entries = [_json.loads(line) for line in log_file.read_text().splitlines()]
+    events = [(e.get("event"), e.get("path")) for e in entries if "event" in e]
+    assert events == [("request_started", "/v1/segment/box"), ("request_completed", "/v1/segment/box")]
+    assert {"time", "level", "logger"} <= set(entries[0])
+    assert entries[-1]["message"] == "plain message" and entries[-1]["logger"] == "perceptra_seg.test"
+
+
+def test_logging_setup_is_idempotent(config: SegmentorConfig) -> None:
+    import logging as _logging
+
+    config.logging.format = "text"
+    create_app(config, models={})
+    create_app(config, models={})
+    ours = [h for h in _logging.getLogger("service").handlers if getattr(h, "_perceptra", False)]
+    assert len(ours) == 1

@@ -152,6 +152,10 @@ curl http://localhost:29086/v1/healthz
   - `SegmentorClient` retries 429/503 (`max_retries=2` by default, `0` disables it).
   - `/metrics`: `perceptra_queue_depth`, `perceptra_gpu_wait_seconds`, `perceptra_inference_seconds`,
     `perceptra_rejected_total`, `perceptra_image_repeat_total`; `/v1/healthz` shows `pending`/`max_pending` per model.
+- **torch.compile**: `SEG_COMPILE=true` (the compose default) compiles the image encoder at startup (~10-30 s extra).
+  It only applies where it was measured to help without changing masks: `sam_v3` (~1.14x encoder) and `sam_v1`
+  in fp32 (~1.3x). It is ignored for `sam_v2` (slower than eager under fp16) and for `sam_v1` in fp16/bf16.
+  Throughput is bounded by the GPU: on one RTX 4090, `sam_v3` serves ~10 req/s and `sam_v2` (fp16) ~16-21 req/s.
 - **Limits**: `SEGMENTOR_SERVER_MAX_IMAGE_SIZE_MB` / `SEGMENTOR_SERVER_MAX_IMAGE_DIMENSION` (413 when exceeded).
 - Any config value can be overridden with `SEGMENTOR_<SECTION>_<FIELD>`, or mount a YAML file and set `SEGMENTOR_CONFIG=/path/config.yaml`.
 

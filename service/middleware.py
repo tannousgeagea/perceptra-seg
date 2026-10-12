@@ -12,12 +12,17 @@ from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
 
+# Polled by the container healthcheck and Prometheus; logging them would drown real traffic.
+_QUIET_PATHS = ("/v1/healthz", "/metrics")
+
 
 class LoggingMiddleware(BaseHTTPMiddleware):
     """Middleware for structured request/response logging."""
 
     async def dispatch(self, request: Request, call_next: Any) -> Response:
         """Process request and log details."""
+        if request.url.path.startswith(_QUIET_PATHS):
+            return await call_next(request)
         request_id = str(uuid.uuid4())
         start_time = time.time()
 

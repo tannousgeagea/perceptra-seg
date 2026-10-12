@@ -86,11 +86,18 @@ class TorchSAMv3Backend:
                 load_from_HF=checkpoint_path is None,
                 enable_inst_interactivity=True,
             ).to(self.device)
+            if self.config.runtime.compile:
+                backbone = self.model.backbone
+                backbone.vision_backbone = torch.compile(backbone.vision_backbone)
             self.processor = Sam3Processor(
                 self.model,
                 device=str(self.device),
                 confidence_threshold=self.config.thresholds.concept_confidence_threshold,
             )
+            if self.config.runtime.compile:
+                logger.info("Compiling SAM3 vision backbone (one-time warm-up)...")
+                with self._autocast():
+                    self.processor.set_image(Image.new("RGB", (1008, 1008)))
             logger.info("SAM3 processor initialized")
         except Exception as e:
             raise ModelLoadError(f"Failed to load SAM v3: {e}") from e

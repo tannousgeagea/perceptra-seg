@@ -37,6 +37,9 @@ class TorchSAMv2Backend:
             # Weights stay fp32; fp16/bf16 is applied per call via autocast.
             sam2_model = build_sam2(model_cfg, checkpoint_path, device=self.device)
             self.predictor = SAM2ImagePredictor(sam2_model)
+            if self.config.runtime.compile:
+                # Benchmarked on an RTX 4090: the compiled encoder was 0.67-0.88x as fast under fp16.
+                logger.info("runtime.compile is ignored for SAM v2 (slower than eager in benchmarks)")
             logger.info(f"Loaded SAM v2 on {self.device} (precision={self.config.runtime.precision})")
 
         except Exception as e:

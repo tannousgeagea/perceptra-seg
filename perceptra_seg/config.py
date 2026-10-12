@@ -24,6 +24,10 @@ class RuntimeConfig(BaseModel):
     precision: Literal["fp16", "bf16", "fp32"] = "fp32"
     batch_size: int = 1
     enable_batch_inference: bool = True
+    # torch.compile the image encoder (one-time warm-up at load, ~10-30 s). Applies where it was
+    # measured to help without changing masks: sam_v3 (~1.14x) and sam_v1 in fp32 (~1.3x);
+    # ignored for sam_v2 (slower) and for sam_v1 in fp16/bf16 (masks drift).
+    compile: bool = False
     deterministic: bool = True
     seed: int = 42
 

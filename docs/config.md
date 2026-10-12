@@ -64,6 +64,14 @@ runtime:
 - **Default**: `1`
 - **Description**: Batch size for processing multiple prompts
 
+### `runtime.compile`
+- **Type**: `boolean`
+- **Default**: `false` (the Docker Compose deployment sets it to `true`)
+- **Description**: `torch.compile` the image encoder, with a one-time warm-up at load (~10-30 s).
+  Applies to `sam_v3` (~1.14x encoder) and to `sam_v1` in fp32 (~1.3x). Ignored, with a log line, for
+  `sam_v2` (slower than eager under fp16) and for `sam_v1` in fp16/bf16 (masks drift from eager).
+  Env: `SEGMENTOR_RUNTIME_COMPILE`
+
 ### `runtime.deterministic`
 - **Type**: `boolean`
 - **Default**: `true`

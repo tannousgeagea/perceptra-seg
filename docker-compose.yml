@@ -21,6 +21,8 @@ services:
       SEGMENTOR_MODEL_NAMES: ${SEG_MODELS:-sam_v3}
       SEGMENTOR_RUNTIME_DEVICE: ${SEG_DEVICE:-cuda}
       SEGMENTOR_RUNTIME_PRECISION: ${SEG_PRECISION:-fp16}
+      # torch.compile the encoder where it helps (sam_v3, sam_v1 in fp32); adds ~10-30 s to startup.
+      SEGMENTOR_RUNTIME_COMPILE: ${SEG_COMPILE:-true}
       SEGMENTOR_SERVER_API_KEYS: ${SEG_API_KEYS:-}
       HF_TOKEN: ${HF_TOKEN:-}
     ports:

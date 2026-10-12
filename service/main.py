@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
 
 from perceptra_seg.__version__ import __version__
-from perceptra_seg.config import SegmentorConfig, ServerConfig
+from perceptra_seg.config import LoggingConfig, SegmentorConfig, ServerConfig
 from perceptra_seg.exceptions import (
     ImageLoadError,
     InvalidPromptError,
@@ -40,6 +40,53 @@ def _build_info() -> dict[str, Any]:
     except (OSError, ValueError):
         pass
     return info
+
+
+class _JsonFormatter(logging.Formatter):
+    """One JSON object per line; messages that already are JSON objects are merged in."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        entry: dict[str, Any] = {
+            "time": self.formatTime(record),
+            "level": record.levelname,
+            "logger": record.name,
+        }
+        message = record.getMessage()
+        try:
+            payload = json.loads(message)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            entry.update(payload)
+        else:
+            entry["message"] = message
+        if record.exc_info:
+            entry["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(entry)
+
+
+_APP_LOGGERS = ("perceptra_seg", "service")
+
+
+def _configure_logging(cfg: LoggingConfig) -> None:
+    """Send the app's own log records (uvicorn configures only its loggers) per ``cfg``.
+
+    Idempotent: a handler installed by an earlier call is replaced, not duplicated.
+    """
+    handler: logging.Handler = logging.FileHandler(cfg.log_file) if cfg.log_file else logging.StreamHandler()
+    if cfg.format == "json":
+        handler.setFormatter(_JsonFormatter())
+    else:
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    handler._perceptra = True  # type: ignore[attr-defined]
+    for name in _APP_LOGGERS:
+        app_logger = logging.getLogger(name)
+        for old in [h for h in app_logger.handlers if getattr(h, "_perceptra", False)]:
+            app_logger.removeHandler(old)
+            old.close()
+        app_logger.addHandler(handler)
+        app_logger.setLevel(cfg.level)
+        app_logger.propagate = False
 
 
 def _parse_model_names() -> list[str]:
@@ -103,6 +150,7 @@ def create_app(
             embedding). When omitted, models listed in SEGMENTOR_MODEL_NAMES are loaded.
     """
     base_config = config or load_config()
+    _configure_logging(base_config.logging)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
